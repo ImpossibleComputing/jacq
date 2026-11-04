@@ -1,0 +1,3571 @@
+"""Source-patch scaffold for vLLM 0.8.5 int4_kivi recognition.
+
+This deliberately stops short of pretending served KIVI works.  The scaffold
+makes vLLM parse/identify the `int4_kivi` lane, enforces the block_size=32 ABI,
+introduces a KiviFullAttentionSpec with exact byte math, adds a guarded
+GPUModelRunner allocation/binder branch for the paged KIVI tensor bundle, adds
+a guarded attention-backend launch-argument adapter plus Python/C++ torch-op
+bindings for decode and cache-write, adds a first-smoke CUDA cache-writer
+translation unit, and adds the DSL-generated decode artifact to the CUDA
+extension build.  Cache write/decode GPU bitchecks and general cache lifecycle
+coverage are still explicit blockers; this must not be reported as served KIVI.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+from pathlib import Path
+from typing import Callable
+
+from integrations.vllm_kivi.bindings import default_qwen32b_binding_abi
+from integrations.vllm_kivi.layout import KiviModelGeometry, KiviPageLayout
+
+EXPECTED_VLLM_085_HEAD = "3015d5634e74d59704e2b39bab0dbe2e6f86a38a"
+
+KIVI_BACKEND_STUB_REL = "vllm/v1/attention/backends/kivi_dsl.py"
+
+KIVI_BACKEND_STUB = '''# SPDX-License-Identifier: Apache-2.0
+"""Adapter for jacq's DSL-lowered paged KIVI decode torch op.
+
+This file is materialized by the jacq vLLM source patch.  It intentionally does
+not make a served-result claim: the cache-write and decode GPU bitchecks,
+served parity, and lifecycle generalization gates must all clear before any
+served KIVI result can be reported (none have been run in this repository's
+CPU-only environment; see docs/LIMITATIONS.md).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+from typing import Any, Mapping
+
+import torch
+
+KIVI_CACHE_KIND = "int4_kivi_dsl_paged"
+# No K_RESIDUAL/V_RESIDUAL in this ABI: the paged decode kernel reads the
+# residual window from K/V_RESIDUAL_SCRATCH only. Separate residual tensors
+# (plus a per-write copy into them) would be allocated and validated but
+# never read by the kernel, so they are deliberately absent.
+JAC_LAUNCH_ORDER = (
+    "Q", "BLOCK_TABLE", "K_CODE_PAGES", "K_SCALE_PAGES", "K_ZERO_PAGES",
+    "V_CODE_PAGES", "V_SCALE_PAGES", "V_ZERO_PAGES",
+    "K_RESIDUAL_SCRATCH", "V_RESIDUAL_SCRATCH",
+    "SEQ_LEN", "O", "cudaStream_t stream",
+)
+_CACHE_TENSORS = JAC_LAUNCH_ORDER[2:10]
+_WRITE_TENSORS: tuple[str, ...] = ()
+OLD_BLOCKS = 124
+SPARSE_DECODE_ENV = "JAC_KIVI_SPARSE_RETAINED_DECODE"
+PAGE_AWARE_TELEMETRY_DIR_ENV = "JAC_KIVI_PAGE_AWARE_TELEMETRY_DIR"
+CACHE_WRITE_KERNEL_ENV = "JAC_KIVI_CACHE_WRITE_KERNEL"
+
+
+def cache_write_kernel_source() -> str:
+    """Return the single-token KIVI writer implementation selected for serving.
+
+    Default stays on the incumbent hand-CUDA op.  Set
+    ``JAC_KIVI_CACHE_WRITE_KERNEL=jac_dsl`` to opt into the DSL-authored
+    writer only after that writer's GPU bitcheck has cleared.  Unknown values
+    fail closed rather than silently selecting a writer for a
+    correctness-critical cache mutation.
+    """
+
+    raw = os.environ.get(CACHE_WRITE_KERNEL_ENV, "hand_cuda")
+    normalized = raw.strip().lower().replace("-", "_")
+    if normalized in ("hand_cuda", "hand", "cuda", "legacy"):
+        return "hand_cuda"
+    if normalized in ("jac_dsl", "jac", "dsl"):
+        return "jac_dsl"
+    raise ValueError(
+        f"{CACHE_WRITE_KERNEL_ENV} must be hand_cuda or jac_dsl, got {raw!r}"
+    )
+
+
+def sparse_decode_enabled() -> bool:
+    return os.environ.get(SPARSE_DECODE_ENV, "0") in ("1", "true", "TRUE", "yes")
+
+
+def _allocator_module():
+    # Import lazily: the source-patch materializes this sibling module into the
+    # vLLM checkout, but plain unit tests importing kivi_dsl.py outside the
+    # patched source tree should still import cleanly until the sparse path is
+    # actually enabled.
+    from vllm.v1.core import kivi_page_aware_allocator
+
+    return kivi_page_aware_allocator
+
+
+def get_sparse_retained_metadata(request_id: str) -> Mapping[str, Any] | None:
+    return _allocator_module().get_sparse_retained_metadata(request_id)
+
+
+def mark_scheduler_reuse_from_block_table(request_id: str, block_table: torch.Tensor, metadata: Mapping[str, Any] | None = None) -> Mapping[str, Any] | None:
+    if block_table.dtype != torch.int32:
+        raise TypeError("BLOCK_TABLE must be torch.int32 before scheduler-reuse telemetry")
+    block_ids = [int(x) for x in block_table.detach().cpu().tolist()]
+    if metadata is not None:
+        # TP=2 workers are separate processes from the scheduler that created
+        # the allocator metadata, so the module-local registry is empty there.
+        # When scheduler metadata is transferred on CachedRequestData, mark
+        # reuse directly in that copy.
+        copied = dict(metadata)
+        evidence = dict(copied.get("allocator_evidence", copied))
+        freed = set(int(x) for x in evidence.get("freed_block_ids", ()))
+        reused = [int(x) for x in block_ids if int(x) in freed]
+        if reused:
+            evidence["allocator_reused_by_scheduler"] = True
+            evidence["allocator_reused_block_ids"] = reused
+        copied["allocator_evidence"] = evidence
+        return copied
+    return _allocator_module().mark_scheduler_reuse_from_block_ids(request_id, block_ids)
+
+
+def retained_block_table_tensor(metadata: Mapping[str, Any], *, device: torch.device) -> tuple[torch.Tensor, int]:
+    table = metadata.get("sparse_retained_block_table", metadata)
+    block_ids = [int(x) for x in table.get("compact_block_ids", [])]
+    if len(block_ids) > OLD_BLOCKS:
+        raise ValueError(f"NUM_RETAINED_PAGES={len(block_ids)} exceeds OLD_BLOCKS={OLD_BLOCKS}")
+    out = torch.zeros((OLD_BLOCKS,), dtype=torch.int32, device=device)
+    if block_ids:
+        out[:len(block_ids)] = torch.tensor(block_ids, dtype=torch.int32, device=device)
+    return out, len(block_ids)
+
+
+def _sparse_decode_telemetry_row(
+    *,
+    request_id: str,
+    seq_len: int,
+    num_retained_pages: int,
+    dense_old_pages: int,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = metadata.get("allocator_evidence", metadata)
+    sparse_table = metadata.get("sparse_retained_block_table", metadata)
+    row = {
+        "schema": "jacq.kivi.served_sparse_decode_telemetry/v0",
+        "request_id": request_id,
+        "served_sparse_decode_used": True,
+        "seq_len": int(seq_len),
+        "num_retained_pages": int(num_retained_pages),
+        "attended_page_count": int(num_retained_pages),
+        "dense_old_pages": int(dense_old_pages),
+        "allocator_backend": evidence.get("backend"),
+        "allocator_blocks_freed": int(evidence.get("allocator_blocks_freed", 0)),
+        "allocator_reused_by_scheduler": bool(evidence.get("allocator_reused_by_scheduler", False)),
+        "allocator_reused_block_ids": list(evidence.get("allocator_reused_block_ids", ())),
+        "freed_block_ids": list(evidence.get("freed_block_ids", ())),
+        "retained_block_ids": list(sparse_table.get("compact_block_ids", ())),
+        "sparse_retained_block_table_schema": sparse_table.get("schema"),
+    }
+    if row["attended_page_count"] != row["num_retained_pages"]:
+        raise RuntimeError("served sparse telemetry invariant violated: attended_page_count != num_retained_pages")
+    return row
+
+
+def write_sparse_decode_telemetry(row: Mapping[str, Any]) -> None:
+    telemetry_dir = os.environ.get(PAGE_AWARE_TELEMETRY_DIR_ENV)
+    if not telemetry_dir:
+        return
+    path = Path(telemetry_dir) / "kivi_sparse_decode_telemetry.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(dict(row), sort_keys=True) + "\\n")
+
+
+@dataclass(frozen=True)
+class KiviDslLaunchBinding:
+    """Validated argument bundle for the DSL ``jac_launch`` wrapper."""
+
+    q: torch.Tensor
+    block_table: torch.Tensor
+    cache: Mapping[str, Any]
+    seq_len: int
+    out: torch.Tensor
+
+    def jac_launch_args(self) -> tuple[Any, ...]:
+        validate_kivi_cache_bundle(self.cache)
+        if tuple(self.cache.get("jac_launch_order", ())) != JAC_LAUNCH_ORDER:
+            raise RuntimeError("int4_kivi cache bundle has stale jac_launch_order")
+        if self.block_table.dtype != torch.int32:
+            raise TypeError("BLOCK_TABLE must be torch.int32")
+        if self.q.dtype != torch.float16:
+            raise TypeError("Q must be torch.float16")
+        if self.out.dtype != torch.float32:
+            raise TypeError("O must be torch.float32")
+        if self.seq_len < 1 or self.seq_len > 4096:
+            raise ValueError("SEQ_LEN must be in [1, 4096] for the first KIVI DSL lane")
+        tensors = (self.q, self.block_table) + tuple(
+            self.cache[name] for name in _CACHE_TENSORS
+        ) + (self.out,)
+        devices = {tensor.device for tensor in tensors}
+        if len(devices) != 1:
+            raise RuntimeError(f"KIVI jac_launch tensors span devices: {devices}")
+        return tensors[:-1] + (self.seq_len, self.out)
+
+
+def validate_kivi_cache_bundle(cache: Mapping[str, Any]) -> None:
+    if cache.get("kind") != KIVI_CACHE_KIND:
+        raise TypeError("expected GPUModelRunner int4_kivi_dsl_paged cache bundle")
+    missing = [name for name in _CACHE_TENSORS + _WRITE_TENSORS if name not in cache]
+    if missing:
+        raise KeyError(f"KIVI cache bundle missing tensors: {missing}")
+    for name in ("K_CODE_PAGES", "V_CODE_PAGES"):
+        if cache[name].dtype != torch.uint8:
+            raise TypeError(f"{name} must be torch.uint8 packed int4")
+    for name in (
+        "K_SCALE_PAGES", "K_ZERO_PAGES", "V_SCALE_PAGES", "V_ZERO_PAGES",
+        "K_RESIDUAL_SCRATCH",
+        "V_RESIDUAL_SCRATCH",
+    ):
+        if cache[name].dtype != torch.float16:
+            raise TypeError(f"{name} must be torch.float16")
+
+
+def require_kivi_cache_write(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    cache: Mapping[str, Any],
+    seq_len: int,
+) -> None:
+    """Validate/assemble the KIVI cache-write ABI and call the torch op.
+
+    vLLM normally writes the current token's K/V before attention.  The first
+    KIVI branch must not skip that write and decode against stale cache pages.
+    The default registered C++ wrapper is backed by the incumbent hand-CUDA
+    writer.  Set JAC_KIVI_CACHE_WRITE_KERNEL=jac_dsl to route this single-token
+    served-path write through the DSL-authored writer.  The DSL writer carries
+    no correctness claim in this repository; this selector is intentionally
+    explicit, and a GPU bitcheck plus a served parity run are required before
+    any served-result/default-flip claim.
+
+    block_table must be the SAME real vLLM-scheduler-assigned table passed to
+    launch_kivi_dsl_decode for this sequence -- the writer ages a
+    quantized page out to BLOCK_TABLE[logical_page], and decode reads it back
+    from the identical translation. A private/synthetic table here would
+    silently desync writes from reads.
+    """
+
+    validate_kivi_cache_bundle(cache)
+    if key.dtype != torch.float16 or value.dtype != torch.float16:
+        raise TypeError("KIVI cache write expects fp16 key/value tensors")
+    if slot_mapping.dtype != torch.int64:
+        raise TypeError("KIVI cache write expects int64 slot_mapping")
+    if block_table.dtype != torch.int32:
+        raise TypeError("KIVI cache write expects int32 block_table")
+    # Shape reference: K_RESIDUAL was removed from the cache bundle (batched-prefill work
+    # VRAM-tax trim), but K_RESIDUAL_SCRATCH has the identical
+    # [num_kv_heads, *, head_size] shape (just a different middle dimension,
+    # RESIDUAL+BLOCK_SIZE instead of RESIDUAL) -- same NKV/HD info either way.
+    residual = cache["K_RESIDUAL_SCRATCH"]
+    expected = tuple(residual.shape[0:1]) + tuple(residual.shape[2:3])
+    new_k = key.reshape(-1, residual.shape[-1]).contiguous()
+    new_v = value.reshape(-1, residual.shape[-1]).contiguous()
+    if tuple(new_k.shape) != expected:
+        raise RuntimeError(
+            "KIVI key tensor does not match residual [num_kv_heads, head_size]"
+        )
+    if tuple(new_v.shape) != expected:
+        raise RuntimeError(
+            "KIVI value tensor does not match residual [num_kv_heads, head_size]"
+        )
+    tensors = tuple(cache[name] for name in _CACHE_TENSORS + _WRITE_TENSORS) + (
+        new_k, new_v, slot_mapping, block_table,
+    )
+    devices = {tensor.device for tensor in tensors}
+    if len(devices) != 1:
+        raise RuntimeError(f"KIVI cache-write tensors span devices: {devices}")
+    op_name = (
+        "kivi_cache_write_jac_dsl"
+        if cache_write_kernel_source() == "jac_dsl"
+        else "kivi_cache_write_dsl"
+    )
+    op = getattr(torch.ops._C, op_name, None)
+    if op is None:
+        raise RuntimeError(f"torch.ops._C.{op_name} is missing from the source-built vLLM extension")
+    op(*tensors, seq_len)
+
+
+def launch_kivi_dsl_decode(
+    q: torch.Tensor,
+    block_table: torch.Tensor,
+    cache: Mapping[str, Any],
+    out: torch.Tensor,
+    *,
+    seq_len: int,
+    stream: Any,
+) -> None:
+    """Validate/assemble the DSL launch ABI and call the source-built torch op.
+
+    This is still not a complete backend: callers must pass cache-writer/decode
+    GPU bitchecks and lifecycle-generalization gates before reporting a
+    served-KIVI result.
+    """
+
+    args = KiviDslLaunchBinding(q, block_table, cache, seq_len, out).jac_launch_args()
+    if stream is None:
+        torch.ops._C.kivi_decode_dsl(*args)
+    else:
+        with torch.cuda.stream(stream):
+            torch.ops._C.kivi_decode_dsl(*args)
+
+
+def launch_kivi_dsl_decode_sparse_retained(
+    q: torch.Tensor,
+    retained_block_table: torch.Tensor,
+    cache: Mapping[str, Any],
+    out: torch.Tensor,
+    *,
+    seq_len: int,
+    num_retained_pages: int,
+    request_id: str,
+    sparse_metadata: Mapping[str, Any],
+    dense_old_pages: int,
+    stream: Any,
+) -> dict[str, Any]:
+    """Validate/call the served sparse-retained KIVI decode op.
+
+    This is the served-path analog of the kernel triple gate: if the caller
+    enables sparse serving, it must pass retained-page metadata, the CUDA op
+    must be the sparse op, and telemetry must record that attended pages equal
+    NUM_RETAINED_PAGES.  Missing metadata is handled by FlashAttention's
+    fail-closed caller before this helper is reached; this helper validates the
+    ABI and writes the served telemetry row.
+    """
+    validate_kivi_cache_bundle(cache)
+    if retained_block_table.dtype != torch.int32:
+        raise TypeError("RETAINED_BLOCK_TABLE must be torch.int32")
+    if q.dtype != torch.float16:
+        raise TypeError("Q must be torch.float16")
+    if out.dtype != torch.float32:
+        raise TypeError("O must be torch.float32")
+    if retained_block_table.numel() != OLD_BLOCKS:
+        raise ValueError(f"RETAINED_BLOCK_TABLE must have {OLD_BLOCKS} entries")
+    if num_retained_pages < 0 or num_retained_pages > OLD_BLOCKS:
+        raise ValueError("NUM_RETAINED_PAGES must be in [0, OLD_BLOCKS]")
+    cache_tensors = tuple(cache[name] for name in _CACHE_TENSORS)
+    devices = {t.device for t in (q, retained_block_table, out) + cache_tensors}
+    if len(devices) != 1:
+        raise RuntimeError(f"KIVI sparse jac_launch tensors span devices: {devices}")
+    args = (q, retained_block_table) + cache_tensors + (seq_len, num_retained_pages, out)
+    if stream is None:
+        torch.ops._C.kivi_decode_sparse_retained_dsl(*args)
+    else:
+        with torch.cuda.stream(stream):
+            torch.ops._C.kivi_decode_sparse_retained_dsl(*args)
+    row = _sparse_decode_telemetry_row(
+        request_id=request_id,
+        seq_len=seq_len,
+        num_retained_pages=num_retained_pages,
+        dense_old_pages=dense_old_pages,
+        metadata=sparse_metadata,
+    )
+    write_sparse_decode_telemetry(row)
+    return row
+
+
+def require_kivi_cache_write_batched(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    cache: Mapping[str, Any],
+    start_seq_len: int,
+    num_new: int,
+) -> None:
+    """Batched sibling of require_kivi_cache_write (batched prefill-loop fix).
+
+    key/value are [num_new, num_kv_heads, head_size] -- a direct slice of vLLM's
+    own per-request key/value tensors (e.g. key[tok_start:tok_end]), not a
+    single token's [num_kv_heads, head_size]. Writes NUM_NEW new tokens with
+    ONE batched CUDA launch instead of NUM_NEW sequential single-token calls.
+    Callers must pre-split a prefill chunk into sub-chunks via this
+    module's plan_batched_write before calling this -- it does not do its
+    own multi-page age-out looping (see kivi_cache_write_batched_launch's
+    own comment for why one age-out per call is sufficient).
+    """
+
+    validate_kivi_cache_bundle(cache)
+    if key.dtype != torch.float16 or value.dtype != torch.float16:
+        raise TypeError("KIVI cache write expects fp16 key/value tensors")
+    if slot_mapping.dtype != torch.int64:
+        raise TypeError("KIVI cache write expects int64 slot_mapping")
+    if block_table.dtype != torch.int32:
+        raise TypeError("KIVI cache write expects int32 block_table")
+    residual = cache["K_RESIDUAL_SCRATCH"]
+    new_k = key.reshape(num_new, -1, residual.shape[-1]).contiguous()
+    new_v = value.reshape(num_new, -1, residual.shape[-1]).contiguous()
+    tensors = tuple(cache[name] for name in _CACHE_TENSORS + _WRITE_TENSORS) + (
+        new_k, new_v, slot_mapping, block_table,
+    )
+    devices = {tensor.device for tensor in tensors}
+    if len(devices) != 1:
+        raise RuntimeError(f"KIVI batched cache-write tensors span devices: {devices}")
+    torch.ops._C.kivi_cache_write_batched_dsl(*tensors, start_seq_len, num_new)
+
+
+def launch_kivi_dsl_decode_batched(
+    q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    cache: Mapping[str, Any],
+    out: torch.Tensor,
+    *,
+    num_queries: int,
+    stream: Any,
+) -> None:
+    """Batched sibling of launch_kivi_dsl_decode (batched prefill-loop fix).
+
+    q/out are [num_queries, num_heads, head_size] -- a direct slice of vLLM's
+    own per-request query/output tensors, not a single query's [num_heads,
+    head_size]. seq_lens is [num_queries] int32, one seq_len per query in the
+    same order. Decodes NUM_QUERIES queries with ONE batched CUDA launch
+    (2D grid: heads x queries) instead of NUM_QUERIES sequential single-query
+    calls -- the per-query math is unchanged from the single-token kernel
+    (that parity must be GPU-bitchecked before any correctness claim).
+
+    q is made contiguous here (read-only input, so a copy is always safe,
+    unlike out): the single-token path's q[tok_row] is always contiguous
+    (indexing away a leading dim is trivially contiguous regardless of the
+    outer stride), but this path's q[chunk_start:chunk_end] is a RANGE slice,
+    which only stays contiguous if query's own row stride has no gaps -- not
+    guaranteed if query is itself a narrowed view into a larger fused
+    buffer, so enforce contiguity here rather than inside the kernel.
+    """
+
+    validate_kivi_cache_bundle(cache)
+    if tuple(cache.get("jac_launch_order", ())) != JAC_LAUNCH_ORDER:
+        raise RuntimeError("int4_kivi cache bundle has stale jac_launch_order")
+    if block_table.dtype != torch.int32:
+        raise TypeError("BLOCK_TABLE must be torch.int32")
+    if q.dtype != torch.float16:
+        raise TypeError("Q must be torch.float16")
+    if out.dtype != torch.float32:
+        raise TypeError("O must be torch.float32")
+    if seq_lens.dtype != torch.int32:
+        raise TypeError("SEQ_LENS must be torch.int32")
+    # Fail-closed SEQ_LENS value guard: dtype and shape checks do not bound
+    # the values, and the kernel derives every old-page/residual window
+    # bound from them, so an out-of-range entry must be rejected before the
+    # op is dispatched. Reading NUM_QUERIES int32 values back to the host
+    # costs one small device-to-host sync per call -- part of why batched
+    # mode stays opt-in behind JAC_KIVI_BATCHED_PREFILL. The C++ torch op
+    # (kivi_decode_batched_dsl) re-checks the same bound at the launch
+    # boundary.
+    for i, value in enumerate(int(v) for v in seq_lens.detach().cpu().tolist()):
+        if value < 1 or value > 4096:
+            raise ValueError(
+                f"SEQ_LENS[{i}] must be in [1, 4096] for the batched KIVI "
+                f"decode ABI, got {value}"
+            )
+    q = q.contiguous()
+    cache_tensors = tuple(cache[name] for name in _CACHE_TENSORS)
+    args = (q, seq_lens, block_table) + cache_tensors + (num_queries, out)
+    devices = {t.device for t in (q, seq_lens, block_table, out) + cache_tensors}
+    if len(devices) != 1:
+        raise RuntimeError(f"KIVI batched jac_launch tensors span devices: {devices}")
+    if stream is None:
+        torch.ops._C.kivi_decode_batched_dsl(*args)
+    else:
+        with torch.cuda.stream(stream):
+            torch.ops._C.kivi_decode_batched_dsl(*args)
+
+
+# Self-contained copy of the batched-write scheduling arithmetic
+# (batched prefill-loop fix). Duplicated rather than imported: this file is materialized standalone
+# into the vLLM source tree (see this module's own docstring) and must not depend on the jacq repo
+# being importable at serving time -- the jacq-side scheduling module is the
+# unit-tested reference this copy is kept faithful to, not the runtime source
+# of truth for what actually executes here.
+from dataclasses import dataclass as _dataclass
+
+
+def _split_old_tokens_batched(seq_len: int, residual: int, block_size: int) -> int:
+    quantizable = seq_len - residual
+    if quantizable < 0:
+        return 0
+    return (quantizable // block_size) * block_size
+
+
+@_dataclass(frozen=True)
+class KiviWriteSubChunk:
+    start_seq_len: int
+    num_new: int
+    scratch_start: int
+    age_out_page: int | None
+    post_shift_residual_len: int | None
+
+
+def plan_batched_write(
+    start_seq_len: int,
+    num_new_tokens: int,
+    residual: int = 128,
+    block_size: int = 32,
+) -> list[KiviWriteSubChunk]:
+    if start_seq_len < 0:
+        raise ValueError(f"start_seq_len must be >= 0, got {start_seq_len}")
+    if num_new_tokens < 1:
+        raise ValueError(f"num_new_tokens must be >= 1, got {num_new_tokens}")
+    if residual <= 0 or block_size <= 0:
+        raise ValueError("residual and block_size must be positive")
+
+    scratch_capacity = residual + block_size
+    sub_chunks: list[KiviWriteSubChunk] = []
+    seq_len = start_seq_len
+    remaining = num_new_tokens
+
+    while remaining > 0:
+        prev_old_tokens = _split_old_tokens_batched(seq_len, residual, block_size)
+        prev_residual_len = seq_len - prev_old_tokens
+        room_before_age_out = scratch_capacity - prev_residual_len
+        take = min(remaining, room_before_age_out)
+        if take <= 0:
+            raise ValueError(
+                "planning invariant violated: no room to append even one "
+                f"token (prev_residual_len={prev_residual_len}, "
+                f"scratch_capacity={scratch_capacity})"
+            )
+        new_seq_len = seq_len + take
+        next_old_tokens = _split_old_tokens_batched(new_seq_len, residual, block_size)
+        if next_old_tokens > prev_old_tokens:
+            logical_page = prev_old_tokens // block_size
+            post_shift_residual_len = new_seq_len - next_old_tokens
+        else:
+            logical_page = None
+            post_shift_residual_len = None
+        sub_chunks.append(
+            KiviWriteSubChunk(
+                start_seq_len=seq_len,
+                num_new=take,
+                scratch_start=prev_residual_len,
+                age_out_page=logical_page,
+                post_shift_residual_len=post_shift_residual_len,
+            )
+        )
+        seq_len = new_seq_len
+        remaining -= take
+
+    return sub_chunks
+'''
+
+
+KIVI_BINDING_REL = "csrc/kivi/decode_attention_kivi_binding.cpp"
+
+KIVI_BINDING_SOURCE = '''// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Impossible Computing Inc. — jacq scaffold: torch-op bindings for the
+// DSL-lowered paged KIVI decode and cache-write kernels.
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <torch/all.h>
+
+#include <cstdint>
+#include <initializer_list>
+
+extern "C" void jac_launch(
+    const __half* Q, const int* BLOCK_TABLE,
+    const unsigned char* K_CODE_PAGES, const __half* K_SCALE_PAGES,
+    const __half* K_ZERO_PAGES, const unsigned char* V_CODE_PAGES,
+    const __half* V_SCALE_PAGES, const __half* V_ZERO_PAGES,
+    const __half* K_RESIDUAL_SCRATCH, const __half* V_RESIDUAL_SCRATCH,
+    int SEQ_LEN, float* O, cudaStream_t stream);
+
+extern "C" void jac_launch_tp2_local(
+    const __half* Q, const int* BLOCK_TABLE,
+    const unsigned char* K_CODE_PAGES, const __half* K_SCALE_PAGES,
+    const __half* K_ZERO_PAGES, const unsigned char* V_CODE_PAGES,
+    const __half* V_SCALE_PAGES, const __half* V_ZERO_PAGES,
+    const __half* K_RESIDUAL_SCRATCH, const __half* V_RESIDUAL_SCRATCH,
+    int SEQ_LEN, float* O, cudaStream_t stream);
+
+// Sparse-retained sibling for the page-aware-eviction bitcheck.  This is a
+// separate op from the dense served path: runtime wiring must explicitly pass a
+// compact retained physical-page table and NUM_RETAINED_PAGES.
+extern "C" void jac_launch_sparse_retained(
+    const __half* Q, const int* RETAINED_BLOCK_TABLE,
+    const unsigned char* K_CODE_PAGES, const __half* K_SCALE_PAGES,
+    const __half* K_ZERO_PAGES, const unsigned char* V_CODE_PAGES,
+    const __half* V_SCALE_PAGES, const __half* V_ZERO_PAGES,
+    const __half* K_RESIDUAL_SCRATCH, const __half* V_RESIDUAL_SCRATCH,
+    int SEQ_LEN, int NUM_RETAINED_PAGES, float* O, cudaStream_t stream);
+
+extern "C" void jac_launch_sparse_retained_tp2_local(
+    const __half* Q, const int* RETAINED_BLOCK_TABLE,
+    const unsigned char* K_CODE_PAGES, const __half* K_SCALE_PAGES,
+    const __half* K_ZERO_PAGES, const unsigned char* V_CODE_PAGES,
+    const __half* V_SCALE_PAGES, const __half* V_ZERO_PAGES,
+    const __half* K_RESIDUAL_SCRATCH, const __half* V_RESIDUAL_SCRATCH,
+    int SEQ_LEN, int NUM_RETAINED_PAGES, float* O, cudaStream_t stream);
+
+// Batched sibling of jac_launch (batched prefill-loop fix): named distinctly because both
+// generated translation units are compiled into this same extension (opt-in alternative to the
+// single-token path, not a replacement) -- two extern "C" jac_launch symbols would collide.
+extern "C" void jac_launch_batched(
+    const __half* Q, const int* SEQ_LENS, const int* BLOCK_TABLE,
+    const unsigned char* K_CODE_PAGES, const __half* K_SCALE_PAGES,
+    const __half* K_ZERO_PAGES, const unsigned char* V_CODE_PAGES,
+    const __half* V_SCALE_PAGES, const __half* V_ZERO_PAGES,
+    const __half* K_RESIDUAL_SCRATCH, const __half* V_RESIDUAL_SCRATCH,
+    int NUM_QUERIES, float* O, cudaStream_t stream);
+
+extern "C" void jac_launch_batched_tp2_local(
+    const __half* Q, const int* SEQ_LENS, const int* BLOCK_TABLE,
+    const unsigned char* K_CODE_PAGES, const __half* K_SCALE_PAGES,
+    const __half* K_ZERO_PAGES, const unsigned char* V_CODE_PAGES,
+    const __half* V_SCALE_PAGES, const __half* V_ZERO_PAGES,
+    const __half* K_RESIDUAL_SCRATCH, const __half* V_RESIDUAL_SCRATCH,
+    int NUM_QUERIES, float* O, cudaStream_t stream);
+
+void kivi_cache_write_launch(
+    unsigned char* K_CODE_PAGES, __half* K_SCALE_PAGES, __half* K_ZERO_PAGES,
+    unsigned char* V_CODE_PAGES, __half* V_SCALE_PAGES, __half* V_ZERO_PAGES,
+    __half* K_RESIDUAL_SCRATCH, __half* V_RESIDUAL_SCRATCH,
+    const __half* NEW_K, const __half* NEW_V, const int64_t* SLOT_MAPPING,
+    const int* BLOCK_TABLE, int seq_len, int NKV_RUNTIME, cudaStream_t stream);
+
+void kivi_cache_write_batched_launch(
+    unsigned char* K_CODE_PAGES, __half* K_SCALE_PAGES, __half* K_ZERO_PAGES,
+    unsigned char* V_CODE_PAGES, __half* V_SCALE_PAGES, __half* V_ZERO_PAGES,
+    __half* K_RESIDUAL_SCRATCH, __half* V_RESIDUAL_SCRATCH,
+    const __half* NEW_K, const __half* NEW_V, const int64_t* SLOT_MAPPING,
+    const int* BLOCK_TABLE, int START_SEQ_LEN, int NUM_NEW, int NKV_RUNTIME,
+    cudaStream_t stream);
+
+// DSL-authored writer, defined in the separate generated translation unit
+// cache_write_kivi_jac_dsl.cu -- NOT the same file as the hand-CUDA kivi_cache_write_launch above
+// (see cache_write_kivi_jac_dsl's own naming rationale: a genuinely different destination path
+// from the existing, misleadingly-named-but-hand-CUDA cache_write_kivi_dsl.cu).
+extern "C" void jac_launch_cache_write(
+    unsigned char* K_CODE_PAGES, __half* K_SCALE_PAGES, __half* K_ZERO_PAGES,
+    unsigned char* V_CODE_PAGES, __half* V_SCALE_PAGES, __half* V_ZERO_PAGES,
+    __half* K_RESIDUAL_SCRATCH, __half* V_RESIDUAL_SCRATCH,
+    const __half* NEW_K, const __half* NEW_V,
+    const int* BLOCK_TABLE, int SEQ_LEN, cudaStream_t stream);
+
+// DSL-authored batched writer comparison artifact, defined in
+// cache_write_kivi_batched_jac_dsl.cu. GPU-bitcheck-only until exact against
+// kivi_cache_write_batched_launch over a multi-subchunk schedule.
+extern "C" void jac_launch_cache_write_batched(
+    unsigned char* K_CODE_PAGES, __half* K_SCALE_PAGES, __half* K_ZERO_PAGES,
+    unsigned char* V_CODE_PAGES, __half* V_SCALE_PAGES, __half* V_ZERO_PAGES,
+    __half* K_RESIDUAL_SCRATCH, __half* V_RESIDUAL_SCRATCH,
+    const __half* NEW_K, const __half* NEW_V,
+    const int* BLOCK_TABLE, int START_SEQ_LEN, int NUM_NEW, cudaStream_t stream);
+
+static constexpr int NH = 40;
+static constexpr int NKV = 8;
+static constexpr int TP2_LOCAL_NH = 20;
+static constexpr int TP2_LOCAL_NKV = 4;
+static constexpr int HD = 128;
+static constexpr int OLD_BLOCKS = 124;
+static constexpr int BLOCK_SIZE = 32;
+static constexpr int HD_PACKED = 64;
+static constexpr int HD_GROUPS = 4;
+static constexpr int RESIDUAL = 128;
+static constexpr int RESIDUAL_SCRATCH = 160;
+static constexpr int MAX_QUERIES = 160;
+
+static void check_cuda_tensor(const torch::Tensor& t, const char* name) {
+  TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous for jac_launch");
+}
+
+static void check_shape(const torch::Tensor& t,
+                        std::initializer_list<int64_t> expected,
+                        const char* name) {
+  TORCH_CHECK(t.dim() == static_cast<int64_t>(expected.size()), name,
+              " rank mismatch for Qwen2.5-Coder-32B KIVI DSL ABI");
+  int64_t axis = 0;
+  for (int64_t want : expected) {
+    TORCH_CHECK(t.size(axis) == want, name, " dim ", axis,
+                " must be ", want,
+                " for Qwen2.5-Coder-32B KIVI DSL ABI, got ",
+                t.size(axis));
+    ++axis;
+  }
+}
+
+static void check_block_table_width(const torch::Tensor& t, const char* name,
+                                    int64_t seq_len) {
+  // Both decode and cache writers address only full 32-token groups aged
+  // past the 128-token residual. This matches KiviDecodeBindingAbi.old_pages:
+  // 0 pages through seq_len=159, 1 at 160, and 124 at 4096. Requiring all
+  // sequence pages would reject the published 124-entry ABI table at 4096.
+  TORCH_CHECK(t.dim() == 1, name,
+              " rank mismatch for Qwen2.5-Coder-32B KIVI DSL ABI");
+  TORCH_CHECK(seq_len >= 1 && seq_len <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+              "SEQ_LEN must be in [1, 4096] for KIVI BLOCK_TABLE validation");
+  const int64_t required_pages =
+      seq_len > RESIDUAL ? (seq_len - RESIDUAL) / BLOCK_SIZE : 0;
+  TORCH_CHECK(t.size(0) >= required_pages, name, " dim 0 must be at least ",
+              required_pages,
+              " for Qwen2.5-Coder-32B KIVI DSL ABI, got ", t.size(0));
+}
+
+// Fail-closed actual-device guard for every launch path in this translation
+// unit. The compute capability of the CUDA device the tensors are bound to
+// must be one of the validated set (8.0 = sm_80/A100, 8.9 = sm_89/RTX 4090),
+// and every tensor must live on that one device. This is the runtime
+// boundary: a declared/detected build target (preflight --cuda-arch, nvcc
+// flags) does not prove which GPU actually serves a request, and a
+// heterogeneous multi-GPU host must not silently launch on an unvalidated
+// device -- so the guard reads the device from the tensors themselves and
+// fails closed on any mixed-device bundle.
+static void check_launch_device(
+    std::initializer_list<const torch::Tensor*> tensors,
+    const char* op_name) {
+  TORCH_CHECK(tensors.size() > 0, op_name, " requires at least one tensor");
+  const c10::Device device = (*tensors.begin())->device();
+  TORCH_CHECK(device.is_cuda(), op_name,
+              " tensors must be bound to a CUDA device, got ", device);
+  for (const torch::Tensor* t : tensors) {
+    TORCH_CHECK(t->device() == device, op_name,
+                " tensors must all live on one CUDA device; got ",
+                t->device(), " alongside ", device);
+  }
+  cudaDeviceProp prop = {};
+  const cudaError_t prop_err = cudaGetDeviceProperties(&prop, device.index());
+  TORCH_CHECK(prop_err == cudaSuccess, op_name,
+              ": cudaGetDeviceProperties failed for CUDA device ",
+              device.index(), ": ", cudaGetErrorString(prop_err));
+  const int compute_cap = prop.major * 10 + prop.minor;
+  TORCH_CHECK(compute_cap == 80 || compute_cap == 89, op_name,
+              ": actual CUDA device ", device.index(), " reports compute "
+              "capability ", prop.major, ".", prop.minor, " (sm_",
+              compute_cap, "), outside the validated set sm_80/sm_89; "
+              "refusing to launch");
+}
+
+static bool is_tp2_local_geometry(int64_t nh, int64_t nkv) {
+  return nh == TP2_LOCAL_NH && nkv == TP2_LOCAL_NKV;
+}
+
+static bool is_global_geometry(int64_t nh, int64_t nkv) {
+  return nh == NH && nkv == NKV;
+}
+
+static void check_supported_geometry(int64_t nh, int64_t nkv, const char* name) {
+  TORCH_CHECK(is_global_geometry(nh, nkv) || is_tp2_local_geometry(nh, nkv),
+              name, " supports Qwen2.5-Coder-32B global NH/NKV 40/8 or "
+              "TP=2 local-rank NH/NKV 20/4; got NH=", nh, " NKV=", nkv);
+}
+
+static int64_t infer_kivi_nkv(const torch::Tensor& k_code_pages) {
+  TORCH_CHECK(k_code_pages.dim() >= 2, "K_CODE_PAGES must expose NKV at dim 1");
+  return k_code_pages.size(1);
+}
+
+// K_RESIDUAL/V_RESIDUAL are NOT part of this ABI: the paged decode kernel
+// reads the residual window from K/V_RESIDUAL_SCRATCH only (see
+// kivi_flash_paged_decode's own comment for why); separate residual tensors
+// would be allocated, validated, and passed through here without ever being
+// read by the kernel.
+void kivi_decode_dsl(torch::Tensor& q, torch::Tensor& block_table,
+                     torch::Tensor& k_code_pages,
+                     torch::Tensor& k_scale_pages,
+                     torch::Tensor& k_zero_pages,
+                     torch::Tensor& v_code_pages,
+                     torch::Tensor& v_scale_pages,
+                     torch::Tensor& v_zero_pages,
+                     torch::Tensor& k_residual_scratch,
+                     torch::Tensor& v_residual_scratch,
+                     int64_t seq_len, torch::Tensor& out) {
+  check_cuda_tensor(q, "Q");
+  check_cuda_tensor(block_table, "BLOCK_TABLE");
+  check_cuda_tensor(k_code_pages, "K_CODE_PAGES");
+  check_cuda_tensor(k_scale_pages, "K_SCALE_PAGES");
+  check_cuda_tensor(k_zero_pages, "K_ZERO_PAGES");
+  check_cuda_tensor(v_code_pages, "V_CODE_PAGES");
+  check_cuda_tensor(v_scale_pages, "V_SCALE_PAGES");
+  check_cuda_tensor(v_zero_pages, "V_ZERO_PAGES");
+  check_cuda_tensor(k_residual_scratch, "K_RESIDUAL_SCRATCH");
+  check_cuda_tensor(v_residual_scratch, "V_RESIDUAL_SCRATCH");
+  check_cuda_tensor(out, "O");
+
+  TORCH_CHECK(q.scalar_type() == at::kHalf, "Q must be fp16");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "BLOCK_TABLE must be int32");
+  TORCH_CHECK(k_code_pages.scalar_type() == at::kByte,
+              "K_CODE_PAGES must be uint8");
+  TORCH_CHECK(v_code_pages.scalar_type() == at::kByte,
+              "V_CODE_PAGES must be uint8");
+  TORCH_CHECK(k_scale_pages.scalar_type() == at::kHalf,
+              "K_SCALE_PAGES must be fp16");
+  TORCH_CHECK(k_zero_pages.scalar_type() == at::kHalf,
+              "K_ZERO_PAGES must be fp16");
+  TORCH_CHECK(v_scale_pages.scalar_type() == at::kHalf,
+              "V_SCALE_PAGES must be fp16");
+  TORCH_CHECK(v_zero_pages.scalar_type() == at::kHalf,
+              "V_ZERO_PAGES must be fp16");
+  TORCH_CHECK(k_residual_scratch.scalar_type() == at::kHalf,
+              "K_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(v_residual_scratch.scalar_type() == at::kHalf,
+              "V_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(out.scalar_type() == at::kFloat, "O must be fp32");
+
+  // K/V_CODE_PAGES etc.'s leading dimension is PAGE STORAGE CAPACITY, sized
+  // to vLLM's real, full physical block count (kivi_cache_tensor_shapes's
+  // num_blocks in source_patch.py's Python allocation -- the SAME value the
+  // standard, non-KIVI AttentionSpec path allocates its own KV cache with,
+  // unreduced). It is independent of OLD_BLOCKS, which is a per-SEQUENCE
+  // bound derived from max_model_len: BLOCK_TABLE's width and the SEQ_LEN
+  // ceiling below correctly stay tied to OLD_BLOCKS (a single sequence can
+  // never need more logical pages than that, regardless of pool size), but
+  // the storage capacity must be read from the tensor itself -- it equals
+  // OLD_BLOCKS only when the pool is pinned to exactly 124 blocks, which a
+  // vLLM-sized pool (real available VRAM) generally exceeds.
+  const int64_t real_num_blocks = k_code_pages.size(0);
+  const int64_t runtime_nh = q.size(0);
+  const int64_t runtime_nkv = infer_kivi_nkv(k_code_pages);
+  check_supported_geometry(runtime_nh, runtime_nkv, "kivi_decode_dsl");
+  TORCH_CHECK(real_num_blocks > 0, "K_CODE_PAGES dim 0 (page storage capacity) must be positive");
+  check_shape(q, {runtime_nh, HD}, "Q");
+  check_block_table_width(block_table, "BLOCK_TABLE", seq_len);
+  check_shape(k_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "K_CODE_PAGES");
+  check_shape(k_scale_pages, {real_num_blocks, runtime_nkv, HD}, "K_SCALE_PAGES");
+  check_shape(k_zero_pages, {real_num_blocks, runtime_nkv, HD}, "K_ZERO_PAGES");
+  check_shape(v_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "V_CODE_PAGES");
+  check_shape(v_scale_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_SCALE_PAGES");
+  check_shape(v_zero_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_ZERO_PAGES");
+  check_shape(k_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "K_RESIDUAL_SCRATCH");
+  check_shape(v_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "V_RESIDUAL_SCRATCH");
+  check_shape(out, {runtime_nh, HD}, "O");
+  TORCH_CHECK(seq_len >= 1 && seq_len <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+              "SEQ_LEN must be in [1, 4096] for Qwen2.5-Coder-32B KIVI DSL ABI");
+
+  check_launch_device({&q, &block_table, &k_code_pages, &k_scale_pages,
+                       &k_zero_pages, &v_code_pages, &v_scale_pages,
+                       &v_zero_pages, &k_residual_scratch, &v_residual_scratch,
+                       &out},
+                      "kivi_decode_dsl");
+
+  const auto stream = at::cuda::getCurrentCUDAStream(q.device().index());
+  auto launch = is_tp2_local_geometry(runtime_nh, runtime_nkv)
+                    ? jac_launch_tp2_local
+                    : jac_launch;
+  launch(reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+         block_table.data_ptr<int>(), k_code_pages.data_ptr<unsigned char>(),
+         reinterpret_cast<const __half*>(k_scale_pages.data_ptr<at::Half>()),
+         reinterpret_cast<const __half*>(k_zero_pages.data_ptr<at::Half>()),
+         v_code_pages.data_ptr<unsigned char>(),
+         reinterpret_cast<const __half*>(v_scale_pages.data_ptr<at::Half>()),
+         reinterpret_cast<const __half*>(v_zero_pages.data_ptr<at::Half>()),
+         reinterpret_cast<const __half*>(
+             k_residual_scratch.data_ptr<at::Half>()),
+         reinterpret_cast<const __half*>(
+             v_residual_scratch.data_ptr<at::Half>()),
+         static_cast<int>(seq_len), out.data_ptr<float>(), stream.stream());
+}
+
+
+void kivi_decode_sparse_retained_dsl(torch::Tensor& q,
+                                     torch::Tensor& retained_block_table,
+                                     torch::Tensor& k_code_pages,
+                                     torch::Tensor& k_scale_pages,
+                                     torch::Tensor& k_zero_pages,
+                                     torch::Tensor& v_code_pages,
+                                     torch::Tensor& v_scale_pages,
+                                     torch::Tensor& v_zero_pages,
+                                     torch::Tensor& k_residual_scratch,
+                                     torch::Tensor& v_residual_scratch,
+                                     int64_t seq_len,
+                                     int64_t num_retained_pages,
+                                     torch::Tensor& out) {
+  check_cuda_tensor(q, "Q");
+  check_cuda_tensor(retained_block_table, "RETAINED_BLOCK_TABLE");
+  check_cuda_tensor(k_code_pages, "K_CODE_PAGES");
+  check_cuda_tensor(k_scale_pages, "K_SCALE_PAGES");
+  check_cuda_tensor(k_zero_pages, "K_ZERO_PAGES");
+  check_cuda_tensor(v_code_pages, "V_CODE_PAGES");
+  check_cuda_tensor(v_scale_pages, "V_SCALE_PAGES");
+  check_cuda_tensor(v_zero_pages, "V_ZERO_PAGES");
+  check_cuda_tensor(k_residual_scratch, "K_RESIDUAL_SCRATCH");
+  check_cuda_tensor(v_residual_scratch, "V_RESIDUAL_SCRATCH");
+  check_cuda_tensor(out, "O");
+
+  TORCH_CHECK(q.scalar_type() == at::kHalf, "Q must be fp16");
+  TORCH_CHECK(retained_block_table.scalar_type() == at::kInt,
+              "RETAINED_BLOCK_TABLE must be int32");
+  TORCH_CHECK(k_code_pages.scalar_type() == at::kByte,
+              "K_CODE_PAGES must be uint8");
+  TORCH_CHECK(v_code_pages.scalar_type() == at::kByte,
+              "V_CODE_PAGES must be uint8");
+  TORCH_CHECK(k_scale_pages.scalar_type() == at::kHalf,
+              "K_SCALE_PAGES must be fp16");
+  TORCH_CHECK(k_zero_pages.scalar_type() == at::kHalf,
+              "K_ZERO_PAGES must be fp16");
+  TORCH_CHECK(v_scale_pages.scalar_type() == at::kHalf,
+              "V_SCALE_PAGES must be fp16");
+  TORCH_CHECK(v_zero_pages.scalar_type() == at::kHalf,
+              "V_ZERO_PAGES must be fp16");
+  TORCH_CHECK(k_residual_scratch.scalar_type() == at::kHalf,
+              "K_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(v_residual_scratch.scalar_type() == at::kHalf,
+              "V_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(out.scalar_type() == at::kFloat, "O must be fp32");
+
+  const int64_t real_num_blocks = k_code_pages.size(0);
+  const int64_t runtime_nh = q.size(0);
+  const int64_t runtime_nkv = infer_kivi_nkv(k_code_pages);
+  check_supported_geometry(runtime_nh, runtime_nkv, "kivi_decode_sparse_retained_dsl");
+  TORCH_CHECK(real_num_blocks > 0, "K_CODE_PAGES dim 0 (page storage capacity) must be positive");
+  check_shape(q, {runtime_nh, HD}, "Q");
+  check_shape(retained_block_table, {OLD_BLOCKS}, "RETAINED_BLOCK_TABLE");
+  check_shape(k_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "K_CODE_PAGES");
+  check_shape(k_scale_pages, {real_num_blocks, runtime_nkv, HD}, "K_SCALE_PAGES");
+  check_shape(k_zero_pages, {real_num_blocks, runtime_nkv, HD}, "K_ZERO_PAGES");
+  check_shape(v_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "V_CODE_PAGES");
+  check_shape(v_scale_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_SCALE_PAGES");
+  check_shape(v_zero_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_ZERO_PAGES");
+  check_shape(k_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "K_RESIDUAL_SCRATCH");
+  check_shape(v_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "V_RESIDUAL_SCRATCH");
+  check_shape(out, {runtime_nh, HD}, "O");
+  TORCH_CHECK(seq_len >= 1 && seq_len <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+              "SEQ_LEN must be in [1, 4096] for Qwen2.5-Coder-32B KIVI sparse-retained DSL ABI");
+  TORCH_CHECK(num_retained_pages >= 0 && num_retained_pages <= OLD_BLOCKS,
+              "NUM_RETAINED_PAGES must be in [0, OLD_BLOCKS]");
+  TORCH_CHECK(num_retained_pages <= real_num_blocks,
+              "NUM_RETAINED_PAGES cannot exceed physical page storage capacity");
+
+  check_launch_device({&q, &retained_block_table, &k_code_pages,
+                       &k_scale_pages, &k_zero_pages, &v_code_pages,
+                       &v_scale_pages, &v_zero_pages, &k_residual_scratch,
+                       &v_residual_scratch, &out},
+                      "kivi_decode_sparse_retained_dsl");
+
+  const auto stream = at::cuda::getCurrentCUDAStream(q.device().index());
+  auto launch = is_tp2_local_geometry(runtime_nh, runtime_nkv)
+                    ? jac_launch_sparse_retained_tp2_local
+                    : jac_launch_sparse_retained;
+  launch(
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      retained_block_table.data_ptr<int>(),
+      k_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<const __half*>(k_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(k_zero_pages.data_ptr<at::Half>()),
+      v_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<const __half*>(v_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(v_zero_pages.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(
+          k_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(
+          v_residual_scratch.data_ptr<at::Half>()),
+      static_cast<int>(seq_len), static_cast<int>(num_retained_pages),
+      out.data_ptr<float>(), stream.stream());
+}
+
+
+void kivi_cache_write_dsl(torch::Tensor& k_code_pages,
+                          torch::Tensor& k_scale_pages,
+                          torch::Tensor& k_zero_pages,
+                          torch::Tensor& v_code_pages,
+                          torch::Tensor& v_scale_pages,
+                          torch::Tensor& v_zero_pages,
+                          torch::Tensor& k_residual_scratch,
+                          torch::Tensor& v_residual_scratch,
+                          torch::Tensor& new_k,
+                          torch::Tensor& new_v,
+                          torch::Tensor& slot_mapping,
+                          torch::Tensor& block_table,
+                          int64_t seq_len) {
+  check_cuda_tensor(k_code_pages, "K_CODE_PAGES");
+  check_cuda_tensor(k_scale_pages, "K_SCALE_PAGES");
+  check_cuda_tensor(k_zero_pages, "K_ZERO_PAGES");
+  check_cuda_tensor(v_code_pages, "V_CODE_PAGES");
+  check_cuda_tensor(v_scale_pages, "V_SCALE_PAGES");
+  check_cuda_tensor(v_zero_pages, "V_ZERO_PAGES");
+  check_cuda_tensor(k_residual_scratch, "K_RESIDUAL_SCRATCH");
+  check_cuda_tensor(v_residual_scratch, "V_RESIDUAL_SCRATCH");
+  check_cuda_tensor(new_k, "NEW_K");
+  check_cuda_tensor(new_v, "NEW_V");
+  check_cuda_tensor(slot_mapping, "SLOT_MAPPING");
+  check_cuda_tensor(block_table, "BLOCK_TABLE");
+
+  TORCH_CHECK(k_code_pages.scalar_type() == at::kByte,
+              "K_CODE_PAGES must be uint8");
+  TORCH_CHECK(v_code_pages.scalar_type() == at::kByte,
+              "V_CODE_PAGES must be uint8");
+  TORCH_CHECK(k_scale_pages.scalar_type() == at::kHalf,
+              "K_SCALE_PAGES must be fp16");
+  TORCH_CHECK(k_zero_pages.scalar_type() == at::kHalf,
+              "K_ZERO_PAGES must be fp16");
+  TORCH_CHECK(v_scale_pages.scalar_type() == at::kHalf,
+              "V_SCALE_PAGES must be fp16");
+  TORCH_CHECK(v_zero_pages.scalar_type() == at::kHalf,
+              "V_ZERO_PAGES must be fp16");
+  TORCH_CHECK(k_residual_scratch.scalar_type() == at::kHalf,
+              "K_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(v_residual_scratch.scalar_type() == at::kHalf,
+              "V_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(new_k.scalar_type() == at::kHalf, "NEW_K must be fp16");
+  TORCH_CHECK(new_v.scalar_type() == at::kHalf, "NEW_V must be fp16");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong,
+              "SLOT_MAPPING must be int64");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "BLOCK_TABLE must be int32");
+
+  // See kivi_decode_dsl's matching comment: page storage capacity (real
+  // VRAM-derived) and OLD_BLOCKS (per-sequence, max_model_len-derived) are
+  // different axes that coincide only when the pool is pinned to exactly
+  // OLD_BLOCKS. block_table and the SEQ_LEN ceiling correctly stay tied to
+  // OLD_BLOCKS; the page tensors read their real capacity from themselves.
+  const int64_t real_num_blocks = k_code_pages.size(0);
+  const int64_t runtime_nkv = infer_kivi_nkv(k_code_pages);
+  check_supported_geometry(runtime_nkv == NKV ? NH : TP2_LOCAL_NH, runtime_nkv,
+                           "kivi_cache_write_dsl");
+  TORCH_CHECK(real_num_blocks > 0, "K_CODE_PAGES dim 0 (page storage capacity) must be positive");
+  check_shape(k_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "K_CODE_PAGES");
+  check_shape(k_scale_pages, {real_num_blocks, runtime_nkv, HD}, "K_SCALE_PAGES");
+  check_shape(k_zero_pages, {real_num_blocks, runtime_nkv, HD}, "K_ZERO_PAGES");
+  check_shape(v_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "V_CODE_PAGES");
+  check_shape(v_scale_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_SCALE_PAGES");
+  check_shape(v_zero_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_ZERO_PAGES");
+  check_shape(k_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "K_RESIDUAL_SCRATCH");
+  check_shape(v_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "V_RESIDUAL_SCRATCH");
+  check_shape(new_k, {runtime_nkv, HD}, "NEW_K");
+  check_shape(new_v, {runtime_nkv, HD}, "NEW_V");
+  check_block_table_width(block_table, "BLOCK_TABLE", seq_len);
+  TORCH_CHECK(slot_mapping.numel() == 1,
+              "SLOT_MAPPING must contain exactly one decode token in the "
+              "first KIVI DSL writer lane");
+  TORCH_CHECK(seq_len >= 1 && seq_len <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+              "SEQ_LEN must be in [1, 4096] for the first KIVI DSL writer lane");
+
+  check_launch_device({&k_code_pages, &k_scale_pages, &k_zero_pages,
+                       &v_code_pages, &v_scale_pages, &v_zero_pages,
+                       &k_residual_scratch, &v_residual_scratch, &new_k,
+                       &new_v, &slot_mapping, &block_table},
+                      "kivi_cache_write_dsl");
+
+  const auto stream =
+      at::cuda::getCurrentCUDAStream(k_code_pages.device().index());
+  kivi_cache_write_launch(
+      k_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(k_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_zero_pages.data_ptr<at::Half>()),
+      v_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(v_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_zero_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_k.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_v.data_ptr<at::Half>()),
+      slot_mapping.data_ptr<int64_t>(), block_table.data_ptr<int>(),
+      static_cast<int>(seq_len), static_cast<int>(runtime_nkv), stream.stream());
+}
+
+// DSL-authored sibling of kivi_cache_write_dsl: identical validation, but calls
+// jac_launch_cache_write (the codegen-emitted writer from cache_write_kivi_paged.jac) instead of
+// the hand-CUDA kivi_cache_write_launch. Not wired into the request loop -- exists only so a GPU
+// bitcheck can call both writers on identical input state and compare their output tensors
+// directly, before this DSL version can be considered for replacing the hand-CUDA one.
+void kivi_cache_write_jac_dsl(torch::Tensor& k_code_pages,
+                              torch::Tensor& k_scale_pages,
+                              torch::Tensor& k_zero_pages,
+                              torch::Tensor& v_code_pages,
+                              torch::Tensor& v_scale_pages,
+                              torch::Tensor& v_zero_pages,
+                              torch::Tensor& k_residual_scratch,
+                              torch::Tensor& v_residual_scratch,
+                              torch::Tensor& new_k,
+                              torch::Tensor& new_v,
+                              torch::Tensor& slot_mapping,
+                              torch::Tensor& block_table,
+                              int64_t seq_len) {
+  check_cuda_tensor(k_code_pages, "K_CODE_PAGES");
+  check_cuda_tensor(k_scale_pages, "K_SCALE_PAGES");
+  check_cuda_tensor(k_zero_pages, "K_ZERO_PAGES");
+  check_cuda_tensor(v_code_pages, "V_CODE_PAGES");
+  check_cuda_tensor(v_scale_pages, "V_SCALE_PAGES");
+  check_cuda_tensor(v_zero_pages, "V_ZERO_PAGES");
+  check_cuda_tensor(k_residual_scratch, "K_RESIDUAL_SCRATCH");
+  check_cuda_tensor(v_residual_scratch, "V_RESIDUAL_SCRATCH");
+  check_cuda_tensor(new_k, "NEW_K");
+  check_cuda_tensor(new_v, "NEW_V");
+  check_cuda_tensor(slot_mapping, "SLOT_MAPPING");
+  check_cuda_tensor(block_table, "BLOCK_TABLE");
+
+  TORCH_CHECK(k_code_pages.scalar_type() == at::kByte,
+              "K_CODE_PAGES must be uint8");
+  TORCH_CHECK(v_code_pages.scalar_type() == at::kByte,
+              "V_CODE_PAGES must be uint8");
+  TORCH_CHECK(k_scale_pages.scalar_type() == at::kHalf,
+              "K_SCALE_PAGES must be fp16");
+  TORCH_CHECK(k_zero_pages.scalar_type() == at::kHalf,
+              "K_ZERO_PAGES must be fp16");
+  TORCH_CHECK(v_scale_pages.scalar_type() == at::kHalf,
+              "V_SCALE_PAGES must be fp16");
+  TORCH_CHECK(v_zero_pages.scalar_type() == at::kHalf,
+              "V_ZERO_PAGES must be fp16");
+  TORCH_CHECK(k_residual_scratch.scalar_type() == at::kHalf,
+              "K_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(v_residual_scratch.scalar_type() == at::kHalf,
+              "V_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(new_k.scalar_type() == at::kHalf, "NEW_K must be fp16");
+  TORCH_CHECK(new_v.scalar_type() == at::kHalf, "NEW_V must be fp16");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong,
+              "SLOT_MAPPING must be int64");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "BLOCK_TABLE must be int32");
+
+  const int64_t real_num_blocks = k_code_pages.size(0);
+  TORCH_CHECK(real_num_blocks > 0, "K_CODE_PAGES dim 0 (page storage capacity) must be positive");
+  check_shape(k_code_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_PACKED},
+              "K_CODE_PAGES");
+  check_shape(k_scale_pages, {real_num_blocks, NKV, HD}, "K_SCALE_PAGES");
+  check_shape(k_zero_pages, {real_num_blocks, NKV, HD}, "K_ZERO_PAGES");
+  check_shape(v_code_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_PACKED},
+              "V_CODE_PAGES");
+  check_shape(v_scale_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_GROUPS},
+              "V_SCALE_PAGES");
+  check_shape(v_zero_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_GROUPS},
+              "V_ZERO_PAGES");
+  check_shape(k_residual_scratch, {NKV, RESIDUAL + BLOCK_SIZE, HD},
+              "K_RESIDUAL_SCRATCH");
+  check_shape(v_residual_scratch, {NKV, RESIDUAL + BLOCK_SIZE, HD},
+              "V_RESIDUAL_SCRATCH");
+  check_shape(new_k, {NKV, HD}, "NEW_K");
+  check_shape(new_v, {NKV, HD}, "NEW_V");
+  check_block_table_width(block_table, "BLOCK_TABLE", seq_len);
+  TORCH_CHECK(slot_mapping.numel() == 1,
+              "SLOT_MAPPING must contain exactly one decode token in the "
+              "first KIVI DSL writer lane");
+  TORCH_CHECK(seq_len >= 1 && seq_len <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+              "SEQ_LEN must be in [1, 4096] for the first KIVI DSL writer lane");
+
+  check_launch_device({&k_code_pages, &k_scale_pages, &k_zero_pages,
+                       &v_code_pages, &v_scale_pages, &v_zero_pages,
+                       &k_residual_scratch, &v_residual_scratch, &new_k,
+                       &new_v, &slot_mapping, &block_table},
+                      "kivi_cache_write_jac_dsl");
+
+  const auto stream =
+      at::cuda::getCurrentCUDAStream(k_code_pages.device().index());
+  jac_launch_cache_write(
+      k_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(k_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_zero_pages.data_ptr<at::Half>()),
+      v_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(v_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_zero_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_k.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_v.data_ptr<at::Half>()),
+      block_table.data_ptr<int>(),
+      static_cast<int>(seq_len), stream.stream());
+}
+
+// DSL-authored sibling of kivi_cache_write_batched_dsl: identical static first-lane validation,
+// but calls jac_launch_cache_write_batched from cache_write_kivi_paged_batched.jac instead of the
+// hand-CUDA kivi_cache_write_batched_launch. Not wired into the request loop; comparison-only.
+void kivi_cache_write_batched_jac_dsl(torch::Tensor& k_code_pages,
+                                      torch::Tensor& k_scale_pages,
+                                      torch::Tensor& k_zero_pages,
+                                      torch::Tensor& v_code_pages,
+                                      torch::Tensor& v_scale_pages,
+                                      torch::Tensor& v_zero_pages,
+                                      torch::Tensor& k_residual_scratch,
+                                      torch::Tensor& v_residual_scratch,
+                                      torch::Tensor& new_k,
+                                      torch::Tensor& new_v,
+                                      torch::Tensor& slot_mapping,
+                                      torch::Tensor& block_table,
+                                      int64_t start_seq_len,
+                                      int64_t num_new) {
+  check_cuda_tensor(k_code_pages, "K_CODE_PAGES");
+  check_cuda_tensor(k_scale_pages, "K_SCALE_PAGES");
+  check_cuda_tensor(k_zero_pages, "K_ZERO_PAGES");
+  check_cuda_tensor(v_code_pages, "V_CODE_PAGES");
+  check_cuda_tensor(v_scale_pages, "V_SCALE_PAGES");
+  check_cuda_tensor(v_zero_pages, "V_ZERO_PAGES");
+  check_cuda_tensor(k_residual_scratch, "K_RESIDUAL_SCRATCH");
+  check_cuda_tensor(v_residual_scratch, "V_RESIDUAL_SCRATCH");
+  check_cuda_tensor(new_k, "NEW_K");
+  check_cuda_tensor(new_v, "NEW_V");
+  check_cuda_tensor(slot_mapping, "SLOT_MAPPING");
+  check_cuda_tensor(block_table, "BLOCK_TABLE");
+  TORCH_CHECK(k_code_pages.scalar_type() == at::kByte, "K_CODE_PAGES must be uint8");
+  TORCH_CHECK(v_code_pages.scalar_type() == at::kByte, "V_CODE_PAGES must be uint8");
+  TORCH_CHECK(k_scale_pages.scalar_type() == at::kHalf, "K_SCALE_PAGES must be fp16");
+  TORCH_CHECK(k_zero_pages.scalar_type() == at::kHalf, "K_ZERO_PAGES must be fp16");
+  TORCH_CHECK(v_scale_pages.scalar_type() == at::kHalf, "V_SCALE_PAGES must be fp16");
+  TORCH_CHECK(v_zero_pages.scalar_type() == at::kHalf, "V_ZERO_PAGES must be fp16");
+  TORCH_CHECK(k_residual_scratch.scalar_type() == at::kHalf, "K_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(v_residual_scratch.scalar_type() == at::kHalf, "V_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(new_k.scalar_type() == at::kHalf, "NEW_K must be fp16");
+  TORCH_CHECK(new_v.scalar_type() == at::kHalf, "NEW_V must be fp16");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong, "SLOT_MAPPING must be int64");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt, "BLOCK_TABLE must be int32");
+
+  const int64_t real_num_blocks = k_code_pages.size(0);
+  TORCH_CHECK(real_num_blocks > 0, "K_CODE_PAGES dim 0 (page storage capacity) must be positive");
+  TORCH_CHECK(num_new >= 1 && num_new <= RESIDUAL + BLOCK_SIZE,
+              "NUM_NEW must be in [1, RESIDUAL_SCRATCH] for kivi_cache_write_batched_jac_dsl");
+  check_shape(k_code_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_PACKED}, "K_CODE_PAGES");
+  check_shape(k_scale_pages, {real_num_blocks, NKV, HD}, "K_SCALE_PAGES");
+  check_shape(k_zero_pages, {real_num_blocks, NKV, HD}, "K_ZERO_PAGES");
+  check_shape(v_code_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_PACKED}, "V_CODE_PAGES");
+  check_shape(v_scale_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_GROUPS}, "V_SCALE_PAGES");
+  check_shape(v_zero_pages, {real_num_blocks, NKV, BLOCK_SIZE, HD_GROUPS}, "V_ZERO_PAGES");
+  check_shape(k_residual_scratch, {NKV, RESIDUAL + BLOCK_SIZE, HD}, "K_RESIDUAL_SCRATCH");
+  check_shape(v_residual_scratch, {NKV, RESIDUAL + BLOCK_SIZE, HD}, "V_RESIDUAL_SCRATCH");
+  check_shape(new_k, {num_new, NKV, HD}, "NEW_K");
+  check_shape(new_v, {num_new, NKV, HD}, "NEW_V");
+  check_block_table_width(block_table, "BLOCK_TABLE", start_seq_len + num_new);
+  TORCH_CHECK(slot_mapping.numel() == num_new,
+              "SLOT_MAPPING must contain exactly NUM_NEW entries for kivi_cache_write_batched_jac_dsl");
+  TORCH_CHECK(start_seq_len >= 0 && start_seq_len + num_new <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+              "START_SEQ_LEN + NUM_NEW must be in [0, 4096] for kivi_cache_write_batched_jac_dsl");
+
+  check_launch_device({&k_code_pages, &k_scale_pages, &k_zero_pages,
+                       &v_code_pages, &v_scale_pages, &v_zero_pages,
+                       &k_residual_scratch, &v_residual_scratch, &new_k,
+                       &new_v, &slot_mapping, &block_table},
+                      "kivi_cache_write_batched_jac_dsl");
+
+  const auto stream = at::cuda::getCurrentCUDAStream(k_code_pages.device().index());
+  jac_launch_cache_write_batched(
+      k_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(k_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_zero_pages.data_ptr<at::Half>()),
+      v_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(v_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_zero_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_k.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_v.data_ptr<at::Half>()),
+      block_table.data_ptr<int>(), static_cast<int>(start_seq_len),
+      static_cast<int>(num_new), stream.stream());
+}
+
+// Batched sibling of kivi_decode_dsl (batched prefill-loop fix): decodes up to MAX_QUERIES queries
+// (a prefill sub-chunk; see plan_batched_write in the scaffolded kivi_dsl.py) in ONE call instead of one call per query.
+void kivi_decode_batched_dsl(torch::Tensor& q, torch::Tensor& seq_lens,
+                             torch::Tensor& block_table,
+                             torch::Tensor& k_code_pages,
+                             torch::Tensor& k_scale_pages,
+                             torch::Tensor& k_zero_pages,
+                             torch::Tensor& v_code_pages,
+                             torch::Tensor& v_scale_pages,
+                             torch::Tensor& v_zero_pages,
+                             torch::Tensor& k_residual_scratch,
+                             torch::Tensor& v_residual_scratch,
+                             int64_t num_queries, torch::Tensor& out) {
+  check_cuda_tensor(q, "Q");
+  check_cuda_tensor(seq_lens, "SEQ_LENS");
+  check_cuda_tensor(block_table, "BLOCK_TABLE");
+  check_cuda_tensor(k_code_pages, "K_CODE_PAGES");
+  check_cuda_tensor(k_scale_pages, "K_SCALE_PAGES");
+  check_cuda_tensor(k_zero_pages, "K_ZERO_PAGES");
+  check_cuda_tensor(v_code_pages, "V_CODE_PAGES");
+  check_cuda_tensor(v_scale_pages, "V_SCALE_PAGES");
+  check_cuda_tensor(v_zero_pages, "V_ZERO_PAGES");
+  check_cuda_tensor(k_residual_scratch, "K_RESIDUAL_SCRATCH");
+  check_cuda_tensor(v_residual_scratch, "V_RESIDUAL_SCRATCH");
+  check_cuda_tensor(out, "O");
+
+  TORCH_CHECK(q.scalar_type() == at::kHalf, "Q must be fp16");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kInt, "SEQ_LENS must be int32");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "BLOCK_TABLE must be int32");
+  TORCH_CHECK(k_code_pages.scalar_type() == at::kByte,
+              "K_CODE_PAGES must be uint8");
+  TORCH_CHECK(v_code_pages.scalar_type() == at::kByte,
+              "V_CODE_PAGES must be uint8");
+  TORCH_CHECK(k_scale_pages.scalar_type() == at::kHalf,
+              "K_SCALE_PAGES must be fp16");
+  TORCH_CHECK(k_zero_pages.scalar_type() == at::kHalf,
+              "K_ZERO_PAGES must be fp16");
+  TORCH_CHECK(v_scale_pages.scalar_type() == at::kHalf,
+              "V_SCALE_PAGES must be fp16");
+  TORCH_CHECK(v_zero_pages.scalar_type() == at::kHalf,
+              "V_ZERO_PAGES must be fp16");
+  TORCH_CHECK(k_residual_scratch.scalar_type() == at::kHalf,
+              "K_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(v_residual_scratch.scalar_type() == at::kHalf,
+              "V_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(out.scalar_type() == at::kFloat, "O must be fp32");
+
+  // Same real-capacity-vs-OLD_BLOCKS distinction as kivi_decode_dsl -- see
+  // that function's comment for the full account.
+  const int64_t real_num_blocks = k_code_pages.size(0);
+  const int64_t runtime_nh = q.size(1);
+  const int64_t runtime_nkv = infer_kivi_nkv(k_code_pages);
+  check_supported_geometry(runtime_nh, runtime_nkv, "kivi_decode_batched_dsl");
+  TORCH_CHECK(real_num_blocks > 0, "K_CODE_PAGES dim 0 (page storage capacity) must be positive");
+  TORCH_CHECK(num_queries >= 1 && num_queries <= MAX_QUERIES,
+              "NUM_QUERIES must be in [1, MAX_QUERIES] for the batched KIVI DSL decode ABI");
+  // Q/SEQ_LENS/O are sized to exactly NUM_QUERIES (a direct slice of vLLM's own per-request
+  // tensors, e.g. query[tok_start:tok_end]), not a fixed MAX_QUERIES-sized buffer -- the launch
+  // grid's y-dimension is NUM_QUERIES, so the kernel never reads past what's actually provided.
+  check_shape(q, {num_queries, runtime_nh, HD}, "Q");
+  check_shape(seq_lens, {num_queries}, "SEQ_LENS");
+  check_shape(k_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "K_CODE_PAGES");
+  check_shape(k_scale_pages, {real_num_blocks, runtime_nkv, HD}, "K_SCALE_PAGES");
+  check_shape(k_zero_pages, {real_num_blocks, runtime_nkv, HD}, "K_ZERO_PAGES");
+  check_shape(v_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "V_CODE_PAGES");
+  check_shape(v_scale_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_SCALE_PAGES");
+  check_shape(v_zero_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_ZERO_PAGES");
+  check_shape(k_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "K_RESIDUAL_SCRATCH");
+  check_shape(v_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "V_RESIDUAL_SCRATCH");
+  check_shape(out, {num_queries, runtime_nh, HD}, "O");
+
+  // Fail-closed SEQ_LENS value guard (batched decode): dtype and shape
+  // checks do not bound the VALUES, and the kernel derives every
+  // old-page/residual window bound from them, so an out-of-range entry
+  // must abort before launch. This reads NUM_QUERIES int32 values back
+  // to the host -- one small device-to-host sync per batched launch,
+  // part of why batched mode stays opt-in behind JAC_KIVI_BATCHED_PREFILL.
+  // The Python serving wrapper (launch_kivi_dsl_decode_batched) applies
+  // the same bound before dispatching this op.
+  const at::Tensor seq_lens_cpu = seq_lens.to(at::kCPU);
+  const int* const seq_lens_values = seq_lens_cpu.data_ptr<int>();
+  for (int64_t i = 0; i < num_queries; ++i) {
+    TORCH_CHECK(seq_lens_values[i] >= 1 &&
+                    seq_lens_values[i] <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+                "SEQ_LENS[", i, "] must be in [1, 4096] for the batched "
+                "KIVI DSL decode ABI, got ", seq_lens_values[i]);
+    check_block_table_width(block_table, "BLOCK_TABLE", seq_lens_values[i]);
+  }
+
+  check_launch_device({&q, &seq_lens, &block_table, &k_code_pages,
+                       &k_scale_pages, &k_zero_pages, &v_code_pages,
+                       &v_scale_pages, &v_zero_pages, &k_residual_scratch,
+                       &v_residual_scratch, &out},
+                      "kivi_decode_batched_dsl");
+
+  const auto stream = at::cuda::getCurrentCUDAStream(q.device().index());
+  auto launch = is_tp2_local_geometry(runtime_nh, runtime_nkv)
+                    ? jac_launch_batched_tp2_local
+                    : jac_launch_batched;
+  launch(
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      seq_lens.data_ptr<int>(), block_table.data_ptr<int>(),
+      k_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<const __half*>(k_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(k_zero_pages.data_ptr<at::Half>()),
+      v_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<const __half*>(v_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(v_zero_pages.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(
+          k_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(
+          v_residual_scratch.data_ptr<at::Half>()),
+      static_cast<int>(num_queries), out.data_ptr<float>(), stream.stream());
+}
+
+// Batched sibling of kivi_cache_write_dsl (batched prefill-loop fix): writes NUM_NEW new tokens (a
+// prefill sub-chunk; see plan_batched_write in the scaffolded kivi_dsl.py) with ONE batched append instead of NUM_NEW
+// sequential single-token writes. NEW_K/NEW_V are [NUM_NEW, NKV, HD] (token-major) rather than
+// kivi_cache_write_dsl's [NKV, HD] -- a direct slice of vLLM's own per-request key/value tensors.
+void kivi_cache_write_batched_dsl(torch::Tensor& k_code_pages,
+                                  torch::Tensor& k_scale_pages,
+                                  torch::Tensor& k_zero_pages,
+                                  torch::Tensor& v_code_pages,
+                                  torch::Tensor& v_scale_pages,
+                                  torch::Tensor& v_zero_pages,
+                                  torch::Tensor& k_residual_scratch,
+                                  torch::Tensor& v_residual_scratch,
+                                  torch::Tensor& new_k,
+                                  torch::Tensor& new_v,
+                                  torch::Tensor& slot_mapping,
+                                  torch::Tensor& block_table,
+                                  int64_t start_seq_len,
+                                  int64_t num_new) {
+  check_cuda_tensor(k_code_pages, "K_CODE_PAGES");
+  check_cuda_tensor(k_scale_pages, "K_SCALE_PAGES");
+  check_cuda_tensor(k_zero_pages, "K_ZERO_PAGES");
+  check_cuda_tensor(v_code_pages, "V_CODE_PAGES");
+  check_cuda_tensor(v_scale_pages, "V_SCALE_PAGES");
+  check_cuda_tensor(v_zero_pages, "V_ZERO_PAGES");
+  check_cuda_tensor(k_residual_scratch, "K_RESIDUAL_SCRATCH");
+  check_cuda_tensor(v_residual_scratch, "V_RESIDUAL_SCRATCH");
+  check_cuda_tensor(new_k, "NEW_K");
+  check_cuda_tensor(new_v, "NEW_V");
+  check_cuda_tensor(slot_mapping, "SLOT_MAPPING");
+  check_cuda_tensor(block_table, "BLOCK_TABLE");
+
+  TORCH_CHECK(k_code_pages.scalar_type() == at::kByte,
+              "K_CODE_PAGES must be uint8");
+  TORCH_CHECK(v_code_pages.scalar_type() == at::kByte,
+              "V_CODE_PAGES must be uint8");
+  TORCH_CHECK(k_scale_pages.scalar_type() == at::kHalf,
+              "K_SCALE_PAGES must be fp16");
+  TORCH_CHECK(k_zero_pages.scalar_type() == at::kHalf,
+              "K_ZERO_PAGES must be fp16");
+  TORCH_CHECK(v_scale_pages.scalar_type() == at::kHalf,
+              "V_SCALE_PAGES must be fp16");
+  TORCH_CHECK(v_zero_pages.scalar_type() == at::kHalf,
+              "V_ZERO_PAGES must be fp16");
+  TORCH_CHECK(k_residual_scratch.scalar_type() == at::kHalf,
+              "K_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(v_residual_scratch.scalar_type() == at::kHalf,
+              "V_RESIDUAL_SCRATCH must be fp16");
+  TORCH_CHECK(new_k.scalar_type() == at::kHalf, "NEW_K must be fp16");
+  TORCH_CHECK(new_v.scalar_type() == at::kHalf, "NEW_V must be fp16");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong,
+              "SLOT_MAPPING must be int64");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "BLOCK_TABLE must be int32");
+
+  const int64_t real_num_blocks = k_code_pages.size(0);
+  const int64_t runtime_nkv = infer_kivi_nkv(k_code_pages);
+  check_supported_geometry(runtime_nkv == NKV ? NH : TP2_LOCAL_NH, runtime_nkv,
+                           "kivi_cache_write_batched_dsl");
+  TORCH_CHECK(real_num_blocks > 0, "K_CODE_PAGES dim 0 (page storage capacity) must be positive");
+  TORCH_CHECK(num_new >= 1 && num_new <= RESIDUAL_SCRATCH,
+              "NUM_NEW must be in [1, RESIDUAL_SCRATCH] -- callers must pre-split a prefill chunk "
+              "into sub-chunks via plan_batched_write (scaffolded kivi_dsl.py) before calling this op");
+  check_shape(k_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "K_CODE_PAGES");
+  check_shape(k_scale_pages, {real_num_blocks, runtime_nkv, HD}, "K_SCALE_PAGES");
+  check_shape(k_zero_pages, {real_num_blocks, runtime_nkv, HD}, "K_ZERO_PAGES");
+  check_shape(v_code_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_PACKED},
+              "V_CODE_PAGES");
+  check_shape(v_scale_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_SCALE_PAGES");
+  check_shape(v_zero_pages, {real_num_blocks, runtime_nkv, BLOCK_SIZE, HD_GROUPS},
+              "V_ZERO_PAGES");
+  check_shape(k_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "K_RESIDUAL_SCRATCH");
+  check_shape(v_residual_scratch, {runtime_nkv, RESIDUAL + BLOCK_SIZE, HD},
+              "V_RESIDUAL_SCRATCH");
+  check_shape(new_k, {num_new, runtime_nkv, HD}, "NEW_K");
+  check_shape(new_v, {num_new, runtime_nkv, HD}, "NEW_V");
+  check_block_table_width(block_table, "BLOCK_TABLE", start_seq_len + num_new);
+  TORCH_CHECK(slot_mapping.numel() == num_new,
+              "SLOT_MAPPING must contain exactly NUM_NEW entries for the batched KIVI DSL writer");
+  TORCH_CHECK(start_seq_len >= 0 &&
+                  start_seq_len + num_new <= OLD_BLOCKS * BLOCK_SIZE + RESIDUAL,
+              "START_SEQ_LEN + NUM_NEW must be in [0, 4096] for the batched KIVI DSL writer lane");
+
+  check_launch_device({&k_code_pages, &k_scale_pages, &k_zero_pages,
+                       &v_code_pages, &v_scale_pages, &v_zero_pages,
+                       &k_residual_scratch, &v_residual_scratch, &new_k,
+                       &new_v, &slot_mapping, &block_table},
+                      "kivi_cache_write_batched_dsl");
+
+  const auto stream =
+      at::cuda::getCurrentCUDAStream(k_code_pages.device().index());
+  kivi_cache_write_batched_launch(
+      k_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(k_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_zero_pages.data_ptr<at::Half>()),
+      v_code_pages.data_ptr<unsigned char>(),
+      reinterpret_cast<__half*>(v_scale_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_zero_pages.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(k_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(v_residual_scratch.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_k.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(new_v.data_ptr<at::Half>()),
+      slot_mapping.data_ptr<int64_t>(), block_table.data_ptr<int>(),
+      static_cast<int>(start_seq_len), static_cast<int>(num_new),
+      static_cast<int>(runtime_nkv), stream.stream());
+}
+'''
+
+KIVI_CACHE_WRITE_REL = "csrc/kivi/cache_write_kivi_dsl.cu"
+
+KIVI_CACHE_WRITE_SOURCE = '''// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Impossible Computing Inc. — jacq scaffold: hand-CUDA single-token KIVI
+// cache writer with identical validation to the DSL-authored sibling.
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <math.h>
+
+static constexpr int NKV = 8;
+static constexpr int HD = 128;
+static constexpr int OLD_BLOCKS = 124;
+static constexpr int BLOCK_SIZE = 32;
+static constexpr int HD_PACKED = 64;
+static constexpr int HD_GROUPS = 4;
+static constexpr int RESIDUAL = 128;
+
+__device__ __forceinline__ int clamp_code(float x) {
+  int code = static_cast<int>(rintf(x));
+  if (code < 0) return 0;
+  if (code > 15) return 15;
+  return code;
+}
+
+__device__ __forceinline__ unsigned char pack_codes(int lo, int hi) {
+  return static_cast<unsigned char>((lo & 0x0F) | ((hi & 0x0F) << 4));
+}
+
+__device__ __forceinline__ float load_half(const __half* p, int idx) {
+  return __half2float(p[idx]);
+}
+
+__global__ void pack_key_age_out_page_kernel(
+    unsigned char* k_code_pages, __half* k_scale_pages, __half* k_zero_pages,
+    const __half* k_scratch, const int* block_table, int logical_page, int NKV_RUNTIME) {
+  // Translate on the device, not the host: BLOCK_TABLE is a device pointer,
+  // and reading it into a host int here would need a synchronous copy that
+  // breaks the async launch. Decode already does this same lookup inside its
+  // own kernel body (kivi_paged_attention_flash_device_kernel) -- mirror it,
+  // so writer and decode resolve the identical vLLM-scheduler-assigned
+  // physical page for a given logical page.
+  const int age_out_page = block_table[logical_page];
+  const int h = blockIdx.x;
+  const int dp = blockIdx.y;
+  const int d0 = dp * 2;
+  const int d1 = d0 + 1;
+
+  float min0 = load_half(k_scratch, (h * (RESIDUAL + BLOCK_SIZE)) * HD + d0);
+  float max0 = min0;
+  float min1 = load_half(k_scratch, (h * (RESIDUAL + BLOCK_SIZE)) * HD + d1);
+  float max1 = min1;
+  for (int t = 1; t < BLOCK_SIZE; ++t) {
+    const int base = (h * (RESIDUAL + BLOCK_SIZE) + t) * HD;
+    const float x0 = load_half(k_scratch, base + d0);
+    const float x1 = load_half(k_scratch, base + d1);
+    min0 = fminf(min0, x0);
+    max0 = fmaxf(max0, x0);
+    min1 = fminf(min1, x1);
+    max1 = fmaxf(max1, x1);
+  }
+  float scale0 = (max0 - min0) / 15.0f;
+  float scale1 = (max1 - min1) / 15.0f;
+  if (!(scale0 > 0.0f)) scale0 = 1.0f;
+  if (!(scale1 > 0.0f)) scale1 = 1.0f;
+
+  const int k_param_base = (age_out_page * NKV_RUNTIME + h) * HD;
+  k_scale_pages[k_param_base + d0] = __float2half(scale0);
+  k_zero_pages[k_param_base + d0] = __float2half(min0);
+  k_scale_pages[k_param_base + d1] = __float2half(scale1);
+  k_zero_pages[k_param_base + d1] = __float2half(min1);
+
+  for (int t = 0; t < BLOCK_SIZE; ++t) {
+    const int scratch_base = (h * (RESIDUAL + BLOCK_SIZE) + t) * HD;
+    const int code0 =
+        clamp_code((load_half(k_scratch, scratch_base + d0) - min0) / scale0);
+    const int code1 =
+        clamp_code((load_half(k_scratch, scratch_base + d1) - min1) / scale1);
+    const int out =
+        ((age_out_page * NKV_RUNTIME + h) * BLOCK_SIZE + t) * HD_PACKED + dp;
+    k_code_pages[out] = pack_codes(code0, code1);
+  }
+}
+
+__global__ void pack_value_age_out_page_kernel(
+    unsigned char* v_code_pages, __half* v_scale_pages, __half* v_zero_pages,
+    const __half* v_scratch, const int* block_table, int logical_page, int NKV_RUNTIME) {
+  const int age_out_page = block_table[logical_page];
+  const int h = blockIdx.x;
+  const int t = blockIdx.y;
+  const int g = blockIdx.z;
+  const int d_base = g * BLOCK_SIZE;
+
+  float mn = load_half(v_scratch,
+                       (h * (RESIDUAL + BLOCK_SIZE) + t) * HD + d_base);
+  float mx = mn;
+  for (int c = 1; c < BLOCK_SIZE; ++c) {
+    const float x = load_half(
+        v_scratch, (h * (RESIDUAL + BLOCK_SIZE) + t) * HD + d_base + c);
+    mn = fminf(mn, x);
+    mx = fmaxf(mx, x);
+  }
+  float scale = (mx - mn) / 15.0f;
+  if (!(scale > 0.0f)) scale = 1.0f;
+
+  const int param = ((age_out_page * NKV_RUNTIME + h) * BLOCK_SIZE + t) * HD_GROUPS + g;
+  v_scale_pages[param] = __float2half(scale);
+  v_zero_pages[param] = __float2half(mn);
+
+  for (int c = 0; c < BLOCK_SIZE; c += 2) {
+    const int d0 = d_base + c;
+    const int d1 = d0 + 1;
+    const int scratch_base = (h * (RESIDUAL + BLOCK_SIZE) + t) * HD;
+    const int code0 =
+        clamp_code((load_half(v_scratch, scratch_base + d0) - mn) / scale);
+    const int code1 =
+        clamp_code((load_half(v_scratch, scratch_base + d1) - mn) / scale);
+    const int out =
+        ((age_out_page * NKV_RUNTIME + h) * BLOCK_SIZE + t) * HD_PACKED + (d0 / 2);
+    v_code_pages[out] = pack_codes(code0, code1);
+  }
+}
+
+__global__ void append_scratch_token_kernel(
+    __half* k_scratch, __half* v_scratch, const __half* new_k,
+    const __half* new_v, int residual_index, int NKV_RUNTIME) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = NKV_RUNTIME * HD;
+  if (idx >= total) return;
+  const int d = idx % HD;
+  const int h = idx / HD;
+  const int dst = (h * (RESIDUAL + BLOCK_SIZE) + residual_index) * HD + d;
+  k_scratch[dst] = new_k[idx];
+  v_scratch[dst] = new_v[idx];
+}
+
+__global__ void shift_scratch_after_age_out_kernel(
+    __half* k_scratch, __half* v_scratch, int residual_len, int NKV_RUNTIME) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = NKV_RUNTIME * HD;
+  if (idx >= total) return;
+  const int d = idx % HD;
+  const int h = idx / HD;
+  for (int r = 0; r < residual_len; ++r) {
+    const int dst = (h * (RESIDUAL + BLOCK_SIZE) + r) * HD + d;
+    const int src = (h * (RESIDUAL + BLOCK_SIZE) + r + BLOCK_SIZE) * HD + d;
+    k_scratch[dst] = k_scratch[src];
+    v_scratch[dst] = v_scratch[src];
+  }
+}
+
+// A copy_static_residual_tail kernel is deliberately absent here: the paged
+// decode kernel never reads K_RESIDUAL/V_RESIDUAL (only K/V_RESIDUAL_SCRATCH
+// directly), so copying the scratch tail into separate side tensors every
+// write call would be pure wasted work and VRAM.
+
+static inline int split_old_tokens(int seq_len) {
+  int quantizable = seq_len - RESIDUAL;
+  if (quantizable < 0) return 0;
+  return (quantizable / BLOCK_SIZE) * BLOCK_SIZE;
+}
+
+void kivi_cache_write_launch(
+    unsigned char* K_CODE_PAGES, __half* K_SCALE_PAGES, __half* K_ZERO_PAGES,
+    unsigned char* V_CODE_PAGES, __half* V_SCALE_PAGES, __half* V_ZERO_PAGES,
+    __half* K_RESIDUAL_SCRATCH, __half* V_RESIDUAL_SCRATCH,
+    const __half* NEW_K, const __half* NEW_V, const int64_t* SLOT_MAPPING,
+    const int* BLOCK_TABLE, int seq_len, int NKV_RUNTIME, cudaStream_t stream) {
+  // SLOT_MAPPING is validated for shape/dtype by the C++ wrapper but not used
+  // for addressing: physical page placement comes from BLOCK_TABLE, the
+  // same real vLLM-scheduler-assigned table decode reads through. A private
+  // sequential counter here, independent of BLOCK_TABLE, would let two
+  // concurrent sequences collide on the same physical page; vLLM's own
+  // block manager already guarantees distinct physical blocks per
+  // concurrently-active sequence, so translating through its real table is
+  // what buys collision-freedom, for free.
+  (void)SLOT_MAPPING;
+  const int prev_seq_len = seq_len - 1;
+  const int prev_old_tokens = split_old_tokens(prev_seq_len);
+  const int next_old_tokens = split_old_tokens(seq_len);
+  const int prev_residual_len = prev_seq_len - prev_old_tokens;
+  const int next_residual_len = seq_len - next_old_tokens;
+  const int total_token = NKV_RUNTIME * HD;
+  append_scratch_token_kernel<<<(total_token + 255) / 256, 256, 0, stream>>>(
+      K_RESIDUAL_SCRATCH, V_RESIDUAL_SCRATCH, NEW_K, NEW_V, prev_residual_len,
+      NKV_RUNTIME);
+  if (next_old_tokens > prev_old_tokens) {
+    const int logical_page = prev_old_tokens / BLOCK_SIZE;
+    pack_key_age_out_page_kernel<<<dim3(NKV_RUNTIME, HD_PACKED), 1, 0, stream>>>(
+        K_CODE_PAGES, K_SCALE_PAGES, K_ZERO_PAGES, K_RESIDUAL_SCRATCH,
+        BLOCK_TABLE, logical_page, NKV_RUNTIME);
+    pack_value_age_out_page_kernel<<<dim3(NKV_RUNTIME, BLOCK_SIZE, HD_GROUPS), 1, 0, stream>>>(
+        V_CODE_PAGES, V_SCALE_PAGES, V_ZERO_PAGES, V_RESIDUAL_SCRATCH,
+        BLOCK_TABLE, logical_page, NKV_RUNTIME);
+    const int total_shift = NKV_RUNTIME * HD;
+    shift_scratch_after_age_out_kernel<<<(total_shift + 255) / 256, 256, 0, stream>>>(
+        K_RESIDUAL_SCRATCH, V_RESIDUAL_SCRATCH, next_residual_len, NKV_RUNTIME);
+  }
+}
+
+// Batched sibling of append_scratch_token_kernel (batched prefill-loop fix): writes NUM_NEW new
+// tokens' K/V into scratch in one launch (grid covers NUM_NEW*NKV*HD threads) instead of one
+// launch per token. NEW_K/NEW_V are [NUM_NEW, NKV, HD] (token-major), matching a direct slice of
+// vLLM's own [num_tokens, NKV, HD] key/value tensors -- no host-side repacking needed at the call
+// site. Writes to scratch[SCRATCH_START + tok] for tok in [0, NUM_NEW), mirroring
+// append_scratch_token_kernel's single-token addressing generalized over a token range.
+__global__ void append_scratch_tokens_batched_kernel(
+    __half* k_scratch, __half* v_scratch, const __half* new_k,
+    const __half* new_v, int scratch_start, int num_new, int NKV_RUNTIME) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int per_token = NKV_RUNTIME * HD;
+  const int total = num_new * per_token;
+  if (idx >= total) return;
+  const int tok = idx / per_token;
+  const int within = idx % per_token;
+  const int d = within % HD;
+  const int h = within / HD;
+  const int dst = (h * (RESIDUAL + BLOCK_SIZE) + scratch_start + tok) * HD + d;
+  k_scratch[dst] = new_k[idx];
+  v_scratch[dst] = new_v[idx];
+}
+
+// Batched sibling of kivi_cache_write_launch: writes NUM_NEW new tokens (a prefill sub-chunk,
+// see plan_batched_write in the scaffolded kivi_dsl.py) with ONE batched append launch instead of
+// NUM_NEW sequential single-token launches. Ages out AT MOST ONE page per call, unchanged from
+// the single-token function -- correct because the Python planning module bounds each sub-chunk
+// to land exactly on (at most) one age-out boundary (plan_batched_write's own invariant), so
+// this host function does not need its own multi-page age-out loop. Recomputes
+// prev/next_old_tokens from START_SEQ_LEN/NUM_NEW itself
+// (does not trust the Python plan's precomputed values) -- same self-verifying-from-seq_len
+// philosophy as the existing single-token function, so a Python-side planning bug cannot silently
+// mis-address the CUDA-side write.
+//
+// Correctness gate: must be verified bit-identical against repeated single-token
+// kivi_cache_write_launch calls over the same token range (including at least one
+// page age-out) before this function may carry any correctness claim, and live
+// write-then-decode ordering is a separate gate. Neither has been run in this
+// repository's CPU-only environment.
+void kivi_cache_write_batched_launch(
+    unsigned char* K_CODE_PAGES, __half* K_SCALE_PAGES, __half* K_ZERO_PAGES,
+    unsigned char* V_CODE_PAGES, __half* V_SCALE_PAGES, __half* V_ZERO_PAGES,
+    __half* K_RESIDUAL_SCRATCH, __half* V_RESIDUAL_SCRATCH,
+    const __half* NEW_K, const __half* NEW_V, const int64_t* SLOT_MAPPING,
+    const int* BLOCK_TABLE, int START_SEQ_LEN, int NUM_NEW, int NKV_RUNTIME, cudaStream_t stream) {
+  // See kivi_cache_write_launch's own comment: BLOCK_TABLE, not SLOT_MAPPING, is what actually
+  // buys collision-freedom across concurrent sequences.
+  (void)SLOT_MAPPING;
+  const int prev_old_tokens = split_old_tokens(START_SEQ_LEN);
+  const int prev_residual_len = START_SEQ_LEN - prev_old_tokens;
+  const int end_seq_len = START_SEQ_LEN + NUM_NEW;
+  const int next_old_tokens = split_old_tokens(end_seq_len);
+  const int next_residual_len = end_seq_len - next_old_tokens;
+  const int per_token = NKV_RUNTIME * HD;
+  const int total = NUM_NEW * per_token;
+  append_scratch_tokens_batched_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      K_RESIDUAL_SCRATCH, V_RESIDUAL_SCRATCH, NEW_K, NEW_V, prev_residual_len, NUM_NEW,
+      NKV_RUNTIME);
+  if (next_old_tokens > prev_old_tokens) {
+    // At most one page ages out here by construction (plan_batched_write bounds every sub-chunk
+    // to at most one age-out boundary) -- same single age-out call as the per-token function,
+    // reading whatever now occupies scratch[0, BLOCK_SIZE) (either freshly appended by the call
+    // above, if this is the very first sub-chunk starting from an empty/near-empty residual, or
+    // left there by a PRIOR sub-chunk's shift -- either way the invariant "position 0 holds the
+    // oldest live residual token" holds after every append+shift, so this read is always correct
+    // regardless of which case applies).
+    const int logical_page = prev_old_tokens / BLOCK_SIZE;
+    pack_key_age_out_page_kernel<<<dim3(NKV_RUNTIME, HD_PACKED), 1, 0, stream>>>(
+        K_CODE_PAGES, K_SCALE_PAGES, K_ZERO_PAGES, K_RESIDUAL_SCRATCH,
+        BLOCK_TABLE, logical_page, NKV_RUNTIME);
+    pack_value_age_out_page_kernel<<<dim3(NKV_RUNTIME, BLOCK_SIZE, HD_GROUPS), 1, 0, stream>>>(
+        V_CODE_PAGES, V_SCALE_PAGES, V_ZERO_PAGES, V_RESIDUAL_SCRATCH,
+        BLOCK_TABLE, logical_page, NKV_RUNTIME);
+    const int total_shift = NKV_RUNTIME * HD;
+    shift_scratch_after_age_out_kernel<<<(total_shift + 255) / 256, 256, 0, stream>>>(
+        K_RESIDUAL_SCRATCH, V_RESIDUAL_SCRATCH, next_residual_len, NKV_RUNTIME);
+  }
+}
+'''
+
+KIVI_PAGE_AWARE_ALLOCATOR_REL = "vllm/v1/core/kivi_page_aware_allocator.py"
+
+KIVI_PAGE_AWARE_ALLOCATOR_SOURCE = '''# SPDX-License-Identifier: Apache-2.0
+"""Page-aware KIVI block-table compaction for jacq's vLLM source patch.
+
+This file is materialized by jacq's source patch.  It is intentionally a small
+CPU-visible allocator seam: given a dense old-page keep/drop plan, mutate
+KVCacheManager.req_to_blocks, return dropped whole pages to BlockPool, and build
+the sparse retained-page table that the KIVI decode path must consume.  It does
+not make a capacity claim by itself; any served-capacity claim must also observe
+scheduler reuse of the returned blocks and pass the served proof gate.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable, MutableMapping, MutableSequence, Sequence
+from typing import Any
+
+LIVE_ALLOCATOR_BACKEND = "vllm_block_pool"
+SPARSE_BLOCK_TABLE_SCHEMA_ID = "jacq.kivi.sparse_retained_block_table/v0"
+_SPARSE_METADATA_BY_REQUEST_ID: dict[str, dict[str, Any]] = {}
+_FREED_BLOCK_IDS: set[int] = set()
+
+
+def _block_id(block: object) -> int:
+    for name in ("block_id", "block_number", "block_idx"):
+        if hasattr(block, name):
+            return int(getattr(block, name))
+    return int(block)
+
+
+def _validate(original_pages: int, kept_pages: Sequence[int], freed_pages: Sequence[int], req_blocks: Sequence[object]) -> None:
+    if original_pages > len(req_blocks):
+        raise ValueError(
+            f"page-aware plan original_pages={original_pages} exceeds request block table length={len(req_blocks)}"
+        )
+    kept = {int(p) for p in kept_pages}
+    freed = {int(p) for p in freed_pages}
+    expected = set(range(int(original_pages)))
+    if kept & freed:
+        raise ValueError("page-aware kept_pages/freed_pages overlap")
+    if kept | freed != expected:
+        raise ValueError("page-aware kept_pages/freed_pages must cover the dense old-page prefix")
+
+
+def get_sparse_retained_metadata(request_id: str) -> dict[str, Any] | None:
+    return _SPARSE_METADATA_BY_REQUEST_ID.get(request_id)
+
+
+def mark_scheduler_reuse_from_block_ids(request_id: str, block_ids: Sequence[int]) -> dict[str, Any] | None:
+    reused = sorted(_FREED_BLOCK_IDS & {int(block_id) for block_id in block_ids})
+    if not reused:
+        return _SPARSE_METADATA_BY_REQUEST_ID.get(request_id)
+    for metadata in _SPARSE_METADATA_BY_REQUEST_ID.values():
+        evidence = metadata.setdefault("allocator_evidence", {})
+        current = set(int(x) for x in evidence.get("allocator_reused_block_ids", ()))
+        current.update(reused)
+        evidence["allocator_reused_block_ids"] = sorted(current)
+        evidence["allocator_reused_by_scheduler"] = bool(current)
+    return _SPARSE_METADATA_BY_REQUEST_ID.get(request_id)
+
+
+def apply_page_aware_drop_to_vllm_blocks(
+    *,
+    request_id: str,
+    req_blocks: MutableSequence[object],
+    block_pool: Any,
+    original_pages: int,
+    kept_pages: Sequence[int],
+    freed_pages: Sequence[int],
+    req_to_block_hashes: MutableMapping[str, object] | None = None,
+    num_cached_block: MutableMapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Compact retained old pages and return dropped pages to vLLM BlockPool."""
+    _validate(original_pages, kept_pages, freed_pages, req_blocks)
+    before = int(block_pool.get_num_free_blocks())
+    old_prefix = list(req_blocks[:original_pages])
+    untouched_tail = list(req_blocks[original_pages:])
+    kept_blocks = [old_prefix[int(p)] for p in kept_pages]
+    freed_blocks = [old_prefix[int(p)] for p in freed_pages]
+
+    req_blocks[:] = kept_blocks + untouched_tail
+    block_pool.free_blocks(reversed(freed_blocks))
+    after = int(block_pool.get_num_free_blocks())
+
+    prefix_cache_state_dropped = False
+    if req_to_block_hashes is not None:
+        prefix_cache_state_dropped = request_id in req_to_block_hashes
+        req_to_block_hashes.pop(request_id, None)
+    if num_cached_block is not None:
+        prefix_cache_state_dropped = prefix_cache_state_dropped or request_id in num_cached_block
+        num_cached_block.pop(request_id, None)
+
+    sparse_table = {
+        "schema": SPARSE_BLOCK_TABLE_SCHEMA_ID,
+        "request_id": request_id,
+        "original_pages": int(original_pages),
+        "compact_to_original_page": [int(p) for p in kept_pages],
+        "freed_pages": [int(p) for p in freed_pages],
+        "compact_block_ids": [_block_id(block) for block in kept_blocks],
+        "original_to_compact_page": {int(p): i for i, p in enumerate(kept_pages)},
+    }
+    evidence = {
+        "backend": LIVE_ALLOCATOR_BACKEND,
+        "request_id": request_id,
+        "original_pages": int(original_pages),
+        "kept_pages": [int(p) for p in kept_pages],
+        "freed_pages": [int(p) for p in freed_pages],
+        "free_blocks_before": before,
+        "free_blocks_after": after,
+        "allocator_blocks_freed": max(0, after - before),
+        "freed_block_ids": [_block_id(block) for block in freed_blocks],
+        "retained_block_ids": [_block_id(block) for block in kept_blocks],
+        "allocator_reused_block_ids": [],
+        "allocator_reused_by_scheduler": False,
+        "prefix_cache_state_dropped": prefix_cache_state_dropped,
+        "sparse_retained_block_table": sparse_table,
+    }
+    _FREED_BLOCK_IDS.update(int(block_id) for block_id in evidence["freed_block_ids"])
+    _SPARSE_METADATA_BY_REQUEST_ID[request_id] = {
+        "allocator_evidence": evidence,
+        "sparse_retained_block_table": sparse_table,
+    }
+    return evidence
+'''
+
+ADDED_FILES: dict[str, str] = {
+    KIVI_BACKEND_STUB_REL: KIVI_BACKEND_STUB,
+    KIVI_PAGE_AWARE_ALLOCATOR_REL: KIVI_PAGE_AWARE_ALLOCATOR_SOURCE,
+    KIVI_BINDING_REL: KIVI_BINDING_SOURCE,
+    KIVI_CACHE_WRITE_REL: KIVI_CACHE_WRITE_SOURCE,
+}
+
+ANCHORS: dict[str, tuple[str, ...]] = {
+    "CMakeLists.txt": (
+        '  "csrc/attention/merge_attn_states.cu"\n  "csrc/pos_encoding_kernels.cu"',
+    ),
+    "vllm/config.py": (
+        'CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]',
+        'elif self.cache_dtype in get_args(CacheDType):',
+        "\n\n@dataclass\nclass VllmConfig:",
+        '    def __post_init__(self):\n        """Verify configs are valid & consistent with each other.\n        """',
+    ),
+    "vllm/utils.py": ('"fp8_e5m2": torch.uint8,',),
+    "vllm/v1/kv_cache_interface.py": (
+        "class FullAttentionSpec(AttentionSpec):",
+        "return cdiv(max_model_len, self.block_size) * self.page_size_bytes",
+    ),
+    "vllm/v1/worker/gpu_model_runner.py": (
+        "from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,",
+        "if isinstance(kv_cache_spec, AttentionSpec):",
+        "kv_cache_spec[layer_name] = FullAttentionSpec(",
+    ),
+    "vllm/v1/core/sched/output.py": (
+        "from typing import TYPE_CHECKING, Optional",
+        "class CachedRequestData:",
+        "scheduled_cached_reqs: list[CachedRequestData]",
+    ),
+    "vllm/v1/core/sched/scheduler.py": (
+        "import time",
+        "self.kv_cache_manager = KVCacheManager(",
+        "resumed_from_preemption=False,",
+    ),
+    "vllm/v1/attention/backends/flash_attn.py": (
+        "from vllm import _custom_ops as ops",
+        "num_actual_tokens = attn_metadata.num_actual_tokens",
+        "key_cache, value_cache = kv_cache.unbind(0)",
+        "if is_quantized_kv_cache(self.kv_cache_dtype) \\\n"
+        "            and not flash_attn_supports_fp8():",
+    ),
+    "csrc/ops.h": (
+        "void paged_attention_v1(",
+    ),
+    "csrc/torch_bindings.cpp": (
+        'ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);',
+    ),
+    "vllm/engine/arg_utils.py": (
+        "        # No Fp8 KV cache so far.\n"
+        "        if self.kv_cache_dtype != \"auto\":",
+    ),
+    "vllm/v1/core/specialized_manager.py": (
+        "from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheSpec,\n"
+        "                                        SlidingWindowSpec)",
+        "spec_manager_map: dict[type[KVCacheSpec], type[SpecializedManager]] = {\n"
+        "    FullAttentionSpec: FullAttentionManager,\n"
+        "    SlidingWindowSpec: SlidingWindowManager,\n"
+        "}",
+    ),
+    "vllm/v1/core/kv_cache_manager.py": (
+        "from vllm.v1.core.block_pool import BlockPool",
+        "    def free(self, request: Request) -> None:\n"
+        "        \"\"\"Free the blocks allocated for the request.",
+    ),
+}
+
+
+def _replace_once(text: str, old: str, new: str, rel: str) -> str:
+    count = text.count(old)
+    if count != 1:
+        raise ValueError(f"expected exactly one anchor in {rel!r}, found {count}: {old!r}")
+    return text.replace(old, new)
+
+
+KIVI_STARTUP_GUARD_SOURCE = '''def _validate_int4_kivi_compatibility(model_config, cache_config,
+                                      parallel_config):
+    """Reject unsupported KIVI models before loading weights or serving requests."""
+    if cache_config is None or cache_config.cache_dtype != "int4_kivi":
+        return
+    if model_config is None or parallel_config is None:
+        raise ValueError("int4_kivi requires model and parallel configuration")
+    if not envs.VLLM_USE_V1:
+        raise ValueError("int4_kivi requires the Jacq-patched vLLM V1 engine")
+    backend = envs.VLLM_ATTENTION_BACKEND
+    if backend not in (None, "FLASH_ATTN_VLLM_V1"):
+        raise ValueError(
+            "int4_kivi requires the Jacq-patched V1 FlashAttention backend; "
+            f"VLLM_ATTENTION_BACKEND={backend!r} is unsupported")
+
+    architecture = model_config.architectures
+    model_type = getattr(model_config.hf_text_config, "model_type", None)
+    if architecture != ["Qwen2ForCausalLM"] or model_type != "qwen2":
+        raise ValueError(
+            "int4_kivi currently supports only Qwen2ForCausalLM full "
+            "attention with the validated 40/8-head geometry; "
+            f"got architectures={architecture!r}, model_type={model_type!r}")
+    if model_config.use_mla or model_config.get_hf_config_sliding_window() is not None:
+        raise ValueError("int4_kivi does not support MLA or sliding-window attention")
+    if model_config.dtype != torch.float16:
+        raise ValueError("int4_kivi requires fp16 activations; use --dtype half")
+    if not 1 <= model_config.max_model_len <= 4096:
+        raise ValueError("int4_kivi requires --max-model-len in [1, 4096]")
+    if cache_config.block_size != 32:
+        raise ValueError("int4_kivi requires --block-size 32")
+    if cache_config.enable_prefix_caching:
+        raise ValueError("int4_kivi requires --no-enable-prefix-caching")
+
+    tp = parallel_config.tensor_parallel_size
+    pp = parallel_config.pipeline_parallel_size
+    if tp not in (1, 2) or pp != 1:
+        raise ValueError("int4_kivi supports TP=1 or TP=2 with PP=1 only")
+    heads = model_config.hf_text_config.num_attention_heads
+    kv_heads = model_config.get_total_num_kv_heads()
+    head_size = model_config.get_head_size()
+    if (heads, kv_heads, head_size) != (40, 8, 128):
+        raise ValueError(
+            "int4_kivi requires global 40 attention heads, 8 KV heads, "
+            f"and head size 128; got {heads}/{kv_heads}/{head_size}")
+'''
+
+
+def _patch_config(text: str) -> str:
+    text = _replace_once(
+        text,
+        'CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]',
+        'CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2", "int4_kivi"]',
+        "vllm/config.py",
+    )
+    old = '''        elif self.cache_dtype in get_args(CacheDType):
+            logger.info(
+                "Using fp8 data type to store kv cache. It reduces the GPU "
+                "memory footprint and boosts the performance. "
+                "Meanwhile, it may cause accuracy drop without a proper "
+                "scaling factor")
+        else:
+            raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}")
+'''
+    new = '''        elif self.cache_dtype == "int4_kivi":
+            if self.block_size != 32:
+                raise ValueError(
+                    "int4_kivi requires --block-size 32 so KIVI key groups "
+                    "do not straddle vLLM pages.")
+            logger.warning(
+                "Using experimental int4_kivi KV cache. This requires the "
+                "KIVI vLLM source integration: KiviFullAttentionSpec, custom "
+                "allocator tensors, cache write/age-out ops, and paged decode "
+                "kernels. Do not treat config acceptance as served KIVI.")
+        elif self.cache_dtype in get_args(CacheDType):
+            logger.info(
+                "Using fp8 data type to store kv cache. It reduces the GPU "
+                "memory footprint and boosts the performance. "
+                "Meanwhile, it may cause accuracy drop without a proper "
+                "scaling factor")
+        else:
+            raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}")
+'''
+    text = _replace_once(text, old, new, "vllm/config.py")
+    text = _replace_once(
+        text,
+        "\n\n@dataclass\nclass VllmConfig:",
+        "\n\n" + KIVI_STARTUP_GUARD_SOURCE + "\n\n@dataclass\nclass VllmConfig:",
+        "vllm/config.py",
+    )
+    old_post_init = '''    def __post_init__(self):
+        """Verify configs are valid & consistent with each other.
+        """
+'''
+    new_post_init = old_post_init + '''        _validate_int4_kivi_compatibility(
+            self.model_config, self.cache_config, self.parallel_config)
+'''
+    return _replace_once(text, old_post_init, new_post_init, "vllm/config.py")
+
+
+def _patch_cmake(text: str) -> str:
+    return _replace_once(
+        text,
+        '  "csrc/attention/merge_attn_states.cu"\n  "csrc/pos_encoding_kernels.cu"',
+        '  "csrc/attention/merge_attn_states.cu"\n  # DSL-lowered KIVI decode source materialized by jacq:\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json\n  "csrc/kivi/decode_attention_kivi_dsl.cu"\n  # TP=2 source-vLLM workers pass rank-local geometry (NH=20/NKV=4), not global\n  # Qwen32B geometry. Materialize distinct-symbol local artifacts into the same _C:\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json --tp2-local\n  "csrc/kivi/decode_attention_kivi_tp2_local_dsl.cu"\n  # Sparse-retained sibling for page-aware eviction bitchecks; NOT served default:\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json --sparse-retained\n  "csrc/kivi/decode_attention_kivi_sparse_retained_dsl.cu"\n  # TP=2 local sparse sibling:\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json --sparse-retained --tp2-local\n  "csrc/kivi/decode_attention_kivi_sparse_retained_tp2_local_dsl.cu"\n  # Batched sibling (batched prefill-loop fix), opt-in alternative not a replacement:\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json --batched\n  "csrc/kivi/decode_attention_kivi_batched_dsl.cu"\n  # TP=2 local batched sibling:\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json --batched --tp2-local\n  "csrc/kivi/decode_attention_kivi_batched_tp2_local_dsl.cu"\n  "csrc/kivi/decode_attention_kivi_binding.cpp"\n  "csrc/kivi/cache_write_kivi_dsl.cu"\n  # GPU-bitcheck-only DSL writer, NOT wired into the request loop -- see\n  # kivi_cache_write_jac_dsl\'s own comment (KIVI_BINDING_SOURCE) for why this is a separate file\n  # from cache_write_kivi_dsl.cu above (that one is hand-CUDA despite its name):\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json --cache-write\n  "csrc/kivi/cache_write_kivi_jac_dsl.cu"\n  # Batched DSL writer comparison artifact, also GPU-bitcheck-only until proven exact:\n  #   python3 -m integrations.vllm_kivi.dsl_decode --vllm-root <this checkout> --emit --json --cache-write-batched\n  "csrc/kivi/cache_write_kivi_batched_jac_dsl.cu"\n  "csrc/pos_encoding_kernels.cu"',
+        "CMakeLists.txt",
+    )
+
+
+def _patch_utils(text: str) -> str:
+    return _replace_once(
+        text,
+        '    "fp8_e5m2": torch.uint8,\n    "int8": torch.int8,',
+        '    "fp8_e5m2": torch.uint8,\n    # int4_kivi stores packed code tensors plus side scale/zero tensors;\n    # torch.uint8 is only the carrier dtype for packed nibbles.\n    "int4_kivi": torch.uint8,\n    "int8": torch.int8,',
+        "vllm/utils.py",
+    )
+
+
+def _patch_kv_cache_interface(text: str) -> str:
+    insert_after = '''class FullAttentionSpec(AttentionSpec):
+
+    @property
+    def type_id(self) -> str:
+        return f"full_attention_{self.block_size}_{self.page_size_bytes}"
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+
+'''
+    addition = insert_after + '''@dataclass
+class KiviFullAttentionSpec(KVCacheSpec):
+    """Experimental int4 KIVI full-attention cache ABI.
+
+    This spec captures the byte accounting needed by the scheduler.  It is not
+    enough by itself: GPUModelRunner must allocate/bind code tensors, scale/zero
+    tensors, and fp16 residual storage, and the attention backend must use KIVI
+    cache write/age-out plus paged decode kernels.
+    """
+
+    num_kv_heads: int
+    head_size: int
+    nbits: int = 4
+    group_size: int = 32
+    residual_tokens: int = 128
+    dtype_bytes: int = 2
+
+    def __post_init__(self):
+        if self.block_size != self.group_size or self.block_size != 32:
+            raise ValueError("int4_kivi requires block_size == group_size == 32")
+        if self.head_size % self.group_size != 0:
+            raise ValueError("int4_kivi requires head_size divisible by group_size")
+        if self.residual_tokens % self.block_size != 0:
+            raise ValueError("int4_kivi residual_tokens must be page-aligned")
+
+    @property
+    def _elems_per_token(self) -> int:
+        return self.num_kv_heads * self.head_size
+
+    @property
+    def fp16_page_size_bytes(self) -> int:
+        return 2 * self.block_size * self._elems_per_token * self.dtype_bytes
+
+    @property
+    def key_code_page_size_bytes(self) -> int:
+        return self.block_size * self._elems_per_token * self.nbits // 8
+
+    @property
+    def value_code_page_size_bytes(self) -> int:
+        return self.key_code_page_size_bytes
+
+    @property
+    def key_scale_zero_page_size_bytes(self) -> int:
+        token_groups = cdiv(self.block_size, self.group_size)
+        return token_groups * self._elems_per_token * 4
+
+    @property
+    def value_scale_zero_page_size_bytes(self) -> int:
+        channel_groups = self.num_kv_heads * cdiv(self.head_size, self.group_size)
+        return self.block_size * channel_groups * 4
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (self.key_code_page_size_bytes + self.value_code_page_size_bytes
+                + self.key_scale_zero_page_size_bytes
+                + self.value_scale_zero_page_size_bytes)
+
+    @property
+    def hd_packed(self) -> int:
+        return self.head_size * self.nbits // 8
+
+    @property
+    def hd_groups(self) -> int:
+        return cdiv(self.head_size, self.group_size)
+
+    def kivi_cache_tensor_shapes(self, num_blocks: int, max_seqs: int = 1,
+                                  num_query_heads: int = 1,
+                                  max_num_tokens: int = 1) -> dict[str, tuple[int, ...]]:
+        """Allocation shapes for one layer's KIVI bundle.
+
+        Paged storage (K/V_CODE_PAGES etc.) is intentionally NOT sliced by
+        max_seqs: physical pages are shared across concurrently-active
+        sequences via vLLM's real BLOCK_TABLE (slot-allocator stage 1), the same way
+        vLLM's own native KV cache is one shared tensor addressed per-sequence
+        by block ids. Residual/scratch has no BLOCK_TABLE indirection at all
+        (see kivi_cache_write_launch) -- it is a flat per-sequence buffer, so
+        it needs its OWN leading max_seqs dimension to avoid concurrently-
+        active sequences overwriting each other's most-recent-tokens tail.
+        The call site (flash_attn.py) indexes this dimension by each
+        request's STABLE per-lifetime slot, NOT attn_metadata's ephemeral
+        per-call row index -- vLLM's own InputBatch.condense() reassigns row
+        indices when a request finishes and vacates a slot, so only a stable
+        key survives that reassignment. Passes an already-sliced
+        [NKV, ...] view into jac_launch, so the CUDA kernels and the
+        JAC_LAUNCH ABI (bindings.py) are unaffected -- this dimension is
+        purely an allocation-time/call-site concern.
+
+        num_blocks MUST be vLLM's real, full physical block count (the same
+        value the standard, non-KIVI AttentionSpec path allocates its own KV
+        cache tensor with, unmodified) -- NOT reduced by residual_tokens in
+        any way. An earlier version of this function took a smaller
+        "old_blocks = num_blocks - residual_pages" value here, on the theory
+        that the last few logical pages of a sequence are covered by the
+        residual system rather than quantized storage, so page storage could
+        be sized smaller. That reasoning is correct for ESTIMATING per-
+        sequence memory cost (see max_memory_usage_bytes below, which
+        legitimately makes this same distinction) but wrong for sizing the
+        actual page-storage tensor: vLLM's own block manager is unaware of
+        any such split and assigns physical block ids from its FULL pool to
+        ANY logical page of ANY sequence, including ones that do go through
+        pack_key/value_age_out_page_kernel. A smaller tensor leaves the
+        withheld top block ids unbacked: once the block manager assigns one
+        of them, an aged-out page writes out of bounds past K/V_CODE_PAGES
+        (and K/V_SCALE/ZERO_PAGES)'s end, corrupting whatever unrelated
+        tensor PyTorch's allocator placed after it. Such a corruption can
+        surface far from the faulting write (in whichever unrelated kernel
+        next touches the corrupted region), so the invariant -- page-storage
+        capacity must equal the block manager's full id range -- is enforced
+        directly here rather than inferred from any particular test history.
+
+        Sizing note for callers choosing max_seqs: residual+scratch alone
+        costs NKV*(2*RESIDUAL+2*(RESIDUAL+BLOCK_SIZE))*HD*2 bytes per slot
+        per layer -- at Qwen2.5-Coder-32B's shape (NKV=8, RESIDUAL=128,
+        BLOCK_SIZE=32, HD=128, 64 layers) that is 72 MB/slot, so
+        max_seqs=64/128/256 costs +4.5/+9/+18 GB respectively, competing
+        directly with the paged KV pool on the same GPU. No slot reclaim is
+        implemented (see the call site's _slot_by_anchor comment) -- max_seqs
+        bounds DISTINCT requests over a server's lifetime, not just
+        concurrent ones, so size it for one server boot's needs, not a
+        whole multi-phase benchmark's cumulative request count.
+
+        DSL_OUT_SCRATCH exists for a reason worth stating explicitly: a
+        per-call decode output allocated fresh every forward pass via a
+        plain torch.empty() sized to num_actual_tokens (the real, per-step
+        scheduled token count) scales with BATCH WIDTH -- how many
+        concurrently-scheduled sequences share one step, up to
+        max_num_batched_tokens -- not just a single sequence's length. Such
+        a transient allocation is STRUCTURALLY INVISIBLE to vLLM's own
+        memory profiler: vLLM's profiling ("dummy") run always calls
+        attention forward() with attn_metadata=None
+        (gpu_model_runner.py's _dummy_run), and FlashAttentionImpl.forward()
+        returns immediately when attn_metadata is None ("# Profiling run."
+        -- stock vLLM, before any KIVI-specific code even runs) -- so the
+        KIVI request loop, and this allocation with it, never executes
+        during profiling, at ANY batch width. vLLM's own "how much memory
+        is safe to give the KV pool" calculation can only account for what
+        it can see.
+
+        Fix: make this a PERSISTENT, startup-time buffer instead of a
+        transient per-call one, sized to the worst case
+        (max_num_tokens == vLLM's own max_num_batched_tokens) once, up
+        front -- structurally identical to how K_RESIDUAL_SCRATCH etc. are
+        already handled, and thus already covered by
+        safe_gpu_memory_utilization()'s existing tax accounting once that
+        formula includes this term. This trades a small, fixed amount of
+        permanently-reserved VRAM (num_query_heads*head_size*4
+        bytes/token, e.g. 40*128*4=20KB/token at Qwen2.5-Coder-32B's
+        shape) for eliminating an unaccounted-for, width-dependent
+        allocation entirely.
+        """
+        return {
+            "DSL_OUT_SCRATCH": (max_num_tokens, num_query_heads,
+                                  self.head_size),
+            "K_CODE_PAGES": (num_blocks, self.num_kv_heads, self.block_size,
+                              self.hd_packed),
+            "K_SCALE_PAGES": (num_blocks, self.num_kv_heads, self.head_size),
+            "K_ZERO_PAGES": (num_blocks, self.num_kv_heads, self.head_size),
+            "V_CODE_PAGES": (num_blocks, self.num_kv_heads, self.block_size,
+                              self.hd_packed),
+            "V_SCALE_PAGES": (num_blocks, self.num_kv_heads, self.block_size,
+                               self.hd_groups),
+            "V_ZERO_PAGES": (num_blocks, self.num_kv_heads, self.block_size,
+                              self.hd_groups),
+            "K_RESIDUAL_SCRATCH": (max_seqs, self.num_kv_heads,
+                                     self.residual_tokens + self.block_size,
+                                     self.head_size),
+            "V_RESIDUAL_SCRATCH": (max_seqs, self.num_kv_heads,
+                                     self.residual_tokens + self.block_size,
+                                     self.head_size),
+        }
+
+    def jac_launch_order(self) -> tuple[str, ...]:
+        # No K_RESIDUAL/V_RESIDUAL: deliberately absent -- they were
+        # allocated, validated, and passed through the whole decode call
+        # chain without ever being read by the kernel. Must match
+        # KIVI_BINDING_SOURCE's
+        # kivi_decode_dsl torch schema and jac_launch's C ABI exactly.
+        return (
+            "Q", "BLOCK_TABLE", "K_CODE_PAGES", "K_SCALE_PAGES",
+            "K_ZERO_PAGES", "V_CODE_PAGES", "V_SCALE_PAGES",
+            "V_ZERO_PAGES",
+            "K_RESIDUAL_SCRATCH", "V_RESIDUAL_SCRATCH", "SEQ_LEN", "O",
+            "cudaStream_t stream",
+        )
+
+    @property
+    def type_id(self) -> str:
+        return (f"kivi_full_attention_{self.block_size}_{self.group_size}_"
+                f"{self.nbits}_{self.residual_tokens}_{self.page_size_bytes}")
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        num_pages = cdiv(max_model_len, self.block_size)
+        residual_pages = min(cdiv(self.residual_tokens, self.block_size),
+                             num_pages)
+        return ((num_pages - residual_pages) * self.page_size_bytes
+                + residual_pages * self.fp16_page_size_bytes)
+
+
+'''
+    return _replace_once(text, insert_after, addition, "vllm/v1/kv_cache_interface.py")
+
+
+def _patch_gpu_model_runner(text: str) -> str:
+    text = _replace_once(
+        text,
+        "from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,\n                                        KVCacheConfig, KVCacheSpec,\n                                        SlidingWindowSpec)",
+        "from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,\n                                        KiviFullAttentionSpec, KVCacheConfig,\n                                        KVCacheSpec, SlidingWindowSpec)",
+        "vllm/v1/worker/gpu_model_runner.py",
+    )
+    old_alloc = '''                if isinstance(kv_cache_spec, AttentionSpec):
+                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                        num_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                        dtype=dtype,
+                                                        device=self.device)
+                else:
+                    # TODO: add new branches when introducing more types of
+                    # KV cache specs.
+                    raise ValueError("Unknown KV cache spec type.")
+'''
+    new_alloc = '''                if isinstance(kv_cache_spec, KiviFullAttentionSpec):
+                    # Residual/scratch gets its own leading max_num_reqs
+                    # dimension (small, bounded -- the engine-wide
+                    # concurrent-request cap, not vLLM's real physical
+                    # block count) so concurrently-active sequences each
+                    # keep a private most-recent-tokens tail instead of
+                    # overwriting each other's. Paged storage is unaffected
+                    # -- it is already safely shared via the real
+                    # BLOCK_TABLE.
+                    #
+                    # Page storage (K/V_CODE_PAGES etc.) is sized to the
+                    # FULL num_blocks, matching exactly what the standard,
+                    # non-KIVI AttentionSpec path below allocates its own KV
+                    # cache tensor with -- NOT reduced by residual_tokens.
+                    # BLOCK_TABLE entries are assigned from the FULL pool
+                    # regardless of which logical page they back, so a
+                    # smaller tensor would leave the withheld top block ids
+                    # unbacked: an aged-out page landing there would write
+                    # past K/V_CODE_PAGES's end -- an out-of-bounds write
+                    # corrupting whatever unrelated tensor sits after it.
+                    # See kivi_cache_tensor_shapes's docstring for the full
+                    # account.
+                    #
+                    # DSL_OUT_SCRATCH is a PERSISTENT, startup-time buffer
+                    # for the decode call site's per-step output, sized to
+                    # the worst case (max_num_tokens == vLLM's own
+                    # max_num_batched_tokens) once, up front -- NOT a fresh
+                    # torch.empty() per forward-pass call. A transient
+                    # allocation there is structurally invisible to vLLM's
+                    # own memory profiler (attn_metadata is None during
+                    # vLLM's profiling/"dummy" run, and
+                    # FlashAttentionImpl.forward returns immediately in
+                    # that case -- stock vLLM, before any KIVI-specific
+                    # code runs), so vLLM's own "how much memory is safe
+                    # for the KV pool" calculation could never account for
+                    # it. See kivi_cache_tensor_shapes's docstring for the
+                    # full account.
+                    shapes = kv_cache_spec.kivi_cache_tensor_shapes(
+                        num_blocks, max_seqs=self.max_num_reqs,
+                        num_query_heads=self.num_query_heads,
+                        max_num_tokens=self.max_num_tokens)
+                    kv_caches[layer_name] = {
+                        "kind": "int4_kivi_dsl_paged",
+                        "num_blocks": num_blocks,
+                        "max_seqs": self.max_num_reqs,
+                        "max_num_tokens": self.max_num_tokens,
+                        "block_size": kv_cache_spec.block_size,
+                        "residual_tokens": kv_cache_spec.residual_tokens,
+                        "jac_launch_order": kv_cache_spec.jac_launch_order(),
+                        # Both the writer (kivi_cache_write_launch) and
+                        # decode translate logical pages through vLLM's real
+                        # attn_metadata.block_table for this sequence (see
+                        # flash_attn.py call site): vLLM's own block manager
+                        # already guarantees distinct physical blocks per
+                        # concurrently-active sequence, so real addressing is
+                        # what buys collision-freedom across sequences, not a
+                        # synthetic identity/sequential mapping local to
+                        # this bundle. No BLOCK_TABLE_IDENTITY needed here.
+                        "DSL_OUT_SCRATCH": torch.empty(
+                            shapes["DSL_OUT_SCRATCH"], dtype=torch.float32,
+                            device=self.device),
+                        "K_CODE_PAGES": torch.empty(
+                            shapes["K_CODE_PAGES"], dtype=torch.uint8,
+                            device=self.device),
+                        "K_SCALE_PAGES": torch.empty(
+                            shapes["K_SCALE_PAGES"], dtype=torch.float16,
+                            device=self.device),
+                        "K_ZERO_PAGES": torch.empty(
+                            shapes["K_ZERO_PAGES"], dtype=torch.float16,
+                            device=self.device),
+                        "V_CODE_PAGES": torch.empty(
+                            shapes["V_CODE_PAGES"], dtype=torch.uint8,
+                            device=self.device),
+                        "V_SCALE_PAGES": torch.empty(
+                            shapes["V_SCALE_PAGES"], dtype=torch.float16,
+                            device=self.device),
+                        "V_ZERO_PAGES": torch.empty(
+                            shapes["V_ZERO_PAGES"], dtype=torch.float16,
+                            device=self.device),
+                        "K_RESIDUAL_SCRATCH": torch.empty(
+                            shapes["K_RESIDUAL_SCRATCH"], dtype=torch.float16,
+                            device=self.device),
+                        "V_RESIDUAL_SCRATCH": torch.empty(
+                            shapes["V_RESIDUAL_SCRATCH"], dtype=torch.float16,
+                            device=self.device),
+                    }
+                elif isinstance(kv_cache_spec, AttentionSpec):
+                    kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                        num_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    kv_caches[layer_name] = torch.zeros(kv_cache_shape,
+                                                        dtype=dtype,
+                                                        device=self.device)
+                else:
+                    # TODO: add new branches when introducing more types of
+                    # KV cache specs.
+                    raise ValueError("Unknown KV cache spec type.")
+'''
+    text = _replace_once(text, old_alloc, new_alloc, "vllm/v1/worker/gpu_model_runner.py")
+    old_spec = '''                    kv_cache_spec[layer_name] = FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=attn_module.num_kv_heads,
+                        head_size=attn_module.head_size,
+                        dtype=self.kv_cache_dtype,
+                        use_mla=use_mla)
+'''
+    new_spec = '''                    if self.cache_config.cache_dtype == "int4_kivi":
+                        if use_mla:
+                            raise NotImplementedError(
+                                "int4_kivi does not support MLA in the first lane")
+                        if attn_module.head_size != 128:
+                            raise NotImplementedError(
+                                "first int4_kivi lane is guarded to head_size=128")
+                        kv_cache_spec[layer_name] = KiviFullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=attn_module.num_kv_heads,
+                            head_size=attn_module.head_size)
+                    else:
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=attn_module.num_kv_heads,
+                            head_size=attn_module.head_size,
+                            dtype=self.kv_cache_dtype,
+                            use_mla=use_mla)
+'''
+    text = _replace_once(text, old_spec, new_spec, "vllm/v1/worker/gpu_model_runner.py")
+
+    # Stash this step's finished-request ids so the KIVI decode
+    # lane's residual-slot allocator (flash_attn.py's patched
+    # FlashAttentionMetadataBuilder.build(), see _patch_flash_attn) can
+    # reclaim them instead of leaking a slot per finished request forever.
+    # _update_states is the FIRST thing execute_model() calls every step
+    # (verified against this pinned vLLM commit's source), always before
+    # this same step's attention metadata gets built -- so this value is
+    # always fresh by the time build() reads it below, including the
+    # empty-schedule early-return path two lines down (build() simply
+    # won't run that step; this gets overwritten again next real call).
+    # Harmless/unused on non-KIVI runs (build() only reads the attribute
+    # via getattr with a default, see below).
+    old_update_states = '''        self._update_states(scheduler_output)
+        if not scheduler_output.total_num_scheduled_tokens:
+'''
+    new_update_states = '''        self._update_states(scheduler_output)
+        self._kivi_finished_req_ids_this_step = scheduler_output.finished_req_ids
+        sparse_meta = getattr(self, "_kivi_sparse_metadata_by_req_id", None)
+        if sparse_meta is None:
+            sparse_meta = {}
+            self._kivi_sparse_metadata_by_req_id = sparse_meta
+        for finished_id in scheduler_output.finished_req_ids:
+            sparse_meta.pop(finished_id, None)
+        for req_data in scheduler_output.scheduled_cached_reqs:
+            meta = getattr(req_data, "kivi_sparse_metadata", None)
+            if meta is not None:
+                sparse_meta[req_data.req_id] = meta
+        if not scheduler_output.total_num_scheduled_tokens:
+'''
+    text = _replace_once(text, old_update_states, new_update_states,
+                         "vllm/v1/worker/gpu_model_runner.py")
+    old_block_table_update = '''            self.input_batch.block_table.append_row(req_data.new_block_ids,
+                                                    req_index)
+'''
+    new_block_table_update = '''            if req_data.resumed_from_preemption:
+                # jacq page-aware KIVI compaction reuses CachedRequestData's
+                # replacement semantics to send a full compacted block table
+                # for an already-running request. Replace the persistent
+                # InputBatch row too; merely appending would leave dropped
+                # physical pages visible to attention.
+                self.input_batch.block_table.add_row(req_data.new_block_ids,
+                                                     req_index)
+            else:
+                self.input_batch.block_table.append_row(req_data.new_block_ids,
+                                                        req_index)
+'''
+    return _replace_once(text, old_block_table_update, new_block_table_update,
+                         "vllm/v1/worker/gpu_model_runner.py")
+
+
+def _patch_sched_output(text: str) -> str:
+    text = _replace_once(
+        text,
+        "from typing import TYPE_CHECKING, Optional",
+        "from typing import Any, TYPE_CHECKING, Optional",
+        "vllm/v1/core/sched/output.py",
+    )
+    class_marker = "class CachedRequestData:"
+    try:
+        class_start = text.index(class_marker)
+        field_start = text.index('    num_computed_tokens: int\n', class_start)
+    except ValueError as exc:
+        raise RuntimeError(
+            "vllm/v1/core/sched/output.py: CachedRequestData "
+            "num_computed_tokens anchor not found"
+        ) from exc
+    next_class = text.find("\n@dataclass\nclass ", class_start + len(class_marker))
+    class_end = len(text) if next_class == -1 else next_class
+    if "kivi_sparse_metadata" in text[class_start:class_end]:
+        return text
+    insert = (
+        '    num_computed_tokens: int\n'
+        '    # jacq KIVI TP=2 sparse metadata handoff: scheduler/core creates this\n'
+        '    # metadata when it compacts whole pages, but TP workers run in separate\n'
+        '    # processes, so a module-local registry is invisible there. Carry a\n'
+        '    # JSON-serializable copy on the already-sent CachedRequestData diff.\n'
+        '    kivi_sparse_metadata: Optional[dict[str, Any]] = None\n'
+    )
+    field_end = field_start + len('    num_computed_tokens: int\n')
+    return text[:field_start] + insert + text[field_end:]
+
+
+def _patch_scheduler(text: str) -> str:
+    text = _replace_once(
+        text,
+        "import time",
+        "import math\nimport os\nimport time",
+        "vllm/v1/core/sched/scheduler.py",
+    )
+    text = _replace_once(
+        text,
+        "from vllm.v1.core.kv_cache_manager import KVCacheManager",
+        "from vllm.v1.core.kv_cache_manager import KVCacheManager\n"
+        "from vllm.v1.core.kivi_page_aware_allocator import get_sparse_retained_metadata",
+        "vllm/v1/core/sched/scheduler.py",
+    )
+    old_init = '''        self.kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.max_model_len,
+            enable_caching=self.cache_config.enable_prefix_caching,
+            caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
+            use_eagle=self.use_eagle,
+            log_stats=self.log_stats)
+'''
+    new_init = '''        self.kv_cache_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=self.max_model_len,
+            enable_caching=self.cache_config.enable_prefix_caching,
+            caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
+            use_eagle=self.use_eagle,
+            log_stats=self.log_stats)
+
+    def _maybe_apply_kivi_page_aware_drop(self, request: Request) -> bool:
+        """Materialize jacq page-aware sparse-retained metadata for a request.
+
+        This is deliberately conservative: only the sparse-retained decode arm
+        may trigger it, only once per request, and only after at least one old
+        KIVI page is already computed. It mutates vLLM's live req_to_blocks via
+        KVCacheManager.apply_kivi_page_aware_drop(), then the schedule path
+        sends a full replacement block table to workers so the persistent
+        InputBatch row no longer exposes freed pages.
+        """
+        if os.environ.get("JAC_KIVI_SPARSE_RETAINED_DECODE", "0") not in ("1", "true", "TRUE", "yes"):
+            return False
+        if os.environ.get("JAC_KIVI_PAGE_AWARE_POLICY", "disabled") != "page_aware_snapkv_pagedrop_v0":
+            return False
+        if get_sparse_retained_metadata(request.request_id) is not None:
+            return False
+        try:
+            target_fraction = float(os.environ.get("JAC_KIVI_PAGE_AWARE_TARGET_RETAINED_FRACTION", "0.5"))
+        except ValueError as exc:
+            raise RuntimeError("JAC_KIVI_PAGE_AWARE_TARGET_RETAINED_FRACTION must be a float") from exc
+        if not (0.0 < target_fraction <= 1.0):
+            raise RuntimeError("JAC_KIVI_PAGE_AWARE_TARGET_RETAINED_FRACTION must be in (0, 1]")
+        residual_tokens = int(os.environ.get("JAC_KIVI_PAGE_AWARE_RESIDUAL_TOKENS", "128"))
+        min_old_pages = int(os.environ.get("JAC_KIVI_PAGE_AWARE_MIN_OLD_PAGES", "2"))
+        req_blocks = self.kv_cache_manager.req_to_blocks[request.request_id]
+        original_pages = max(0, (int(request.num_computed_tokens) - residual_tokens) // int(self.block_size))
+        original_pages = min(original_pages, len(req_blocks))
+        if original_pages < max(1, min_old_pages):
+            return False
+        target_keep = max(1, math.ceil(original_pages * target_fraction))
+        recent_keep_pages = int(os.environ.get("JAC_KIVI_PAGE_AWARE_RECENT_OLD_PAGES", "4"))
+        hard_keep = set(range(max(0, original_pages - recent_keep_pages), original_pages))
+        ranked = [p for p in range(original_pages) if p not in hard_keep]
+        # No served attention-score source is trusted yet. For this integration
+        # gate use a deterministic whole-page selection to exercise the
+        # allocator, metadata, and sparse-decode plumbing. This is not a
+        # capacity or quality result.
+        score_selected = ranked[:max(0, target_keep - len(hard_keep))]
+        kept_pages = sorted(hard_keep | set(score_selected))
+        freed_pages = [p for p in range(original_pages) if p not in set(kept_pages)]
+        if not freed_pages:
+            return False
+        self.kv_cache_manager.apply_kivi_page_aware_drop(
+            request_id=request.request_id,
+            original_pages=original_pages,
+            kept_pages=kept_pages,
+            freed_pages=freed_pages,
+        )
+        return True
+'''
+    text = _replace_once(text, old_init, new_init, "vllm/v1/core/sched/scheduler.py")
+    text = _replace_once(
+        text,
+        '''        req_to_new_block_ids: dict[str, list[int]] = {}
+        num_scheduled_tokens: dict[str, int] = {}
+''',
+        '''        req_to_new_block_ids: dict[str, list[int]] = {}
+        kivi_compacted_req_ids: set[str] = set()
+        num_scheduled_tokens: dict[str, int] = {}
+''',
+        "vllm/v1/core/sched/scheduler.py",
+    )
+    text = _replace_once(
+        text,
+        '''            # Schedule the request.
+            scheduled_running_reqs.append(request)
+''',
+        '''            if self._maybe_apply_kivi_page_aware_drop(request):
+                kivi_compacted_req_ids.add(request.request_id)
+
+            # Schedule the request.
+            scheduled_running_reqs.append(request)
+''',
+        "vllm/v1/core/sched/scheduler.py",
+    )
+    text = _replace_once(
+        text,
+        '''            req_to_new_block_ids[request.request_id] = [
+                b.block_id for b in new_blocks
+            ]
+''',
+        '''            if request.request_id in kivi_compacted_req_ids:
+                req_to_new_block_ids[request.request_id] = [
+                    b.block_id for b in self.kv_cache_manager.req_to_blocks[request.request_id]
+                ]
+            else:
+                req_to_new_block_ids[request.request_id] = [
+                    b.block_id for b in new_blocks
+                ]
+''',
+        "vllm/v1/core/sched/scheduler.py",
+    )
+    text = _replace_once(
+        text,
+        '''                resumed_from_preemption=False,
+''',
+        '''                resumed_from_preemption=req.request_id in kivi_compacted_req_ids,
+''',
+        "vllm/v1/core/sched/scheduler.py",
+    )
+    text = _replace_once(
+        text,
+        '''        return req_data
+
+    def _try_schedule_encoder_inputs(
+''',
+        '''        req_data.kivi_sparse_metadata = get_sparse_retained_metadata(request.request_id)
+        return req_data
+
+    def _try_schedule_encoder_inputs(
+''',
+        "vllm/v1/core/sched/scheduler.py",
+    )
+    return text
+
+
+def _patch_ops_h(text: str) -> str:
+    old = '''void paged_attention_v1(
+'''
+    new = '''void kivi_decode_dsl(torch::Tensor& q, torch::Tensor& block_table,
+                     torch::Tensor& k_code_pages,
+                     torch::Tensor& k_scale_pages,
+                     torch::Tensor& k_zero_pages,
+                     torch::Tensor& v_code_pages,
+                     torch::Tensor& v_scale_pages,
+                     torch::Tensor& v_zero_pages,
+                     torch::Tensor& k_residual_scratch,
+                     torch::Tensor& v_residual_scratch, int64_t seq_len,
+                     torch::Tensor& out);
+
+void kivi_decode_sparse_retained_dsl(torch::Tensor& q,
+                                     torch::Tensor& retained_block_table,
+                                     torch::Tensor& k_code_pages,
+                                     torch::Tensor& k_scale_pages,
+                                     torch::Tensor& k_zero_pages,
+                                     torch::Tensor& v_code_pages,
+                                     torch::Tensor& v_scale_pages,
+                                     torch::Tensor& v_zero_pages,
+                                     torch::Tensor& k_residual_scratch,
+                                     torch::Tensor& v_residual_scratch,
+                                     int64_t seq_len,
+                                     int64_t num_retained_pages,
+                                     torch::Tensor& out);
+
+void kivi_cache_write_dsl(torch::Tensor& k_code_pages,
+                          torch::Tensor& k_scale_pages,
+                          torch::Tensor& k_zero_pages,
+                          torch::Tensor& v_code_pages,
+                          torch::Tensor& v_scale_pages,
+                          torch::Tensor& v_zero_pages,
+                          torch::Tensor& k_residual_scratch,
+                          torch::Tensor& v_residual_scratch,
+                          torch::Tensor& new_k,
+                          torch::Tensor& new_v,
+                          torch::Tensor& slot_mapping,
+                          torch::Tensor& block_table,
+                          int64_t seq_len);
+
+void kivi_decode_batched_dsl(torch::Tensor& q, torch::Tensor& seq_lens,
+                             torch::Tensor& block_table,
+                             torch::Tensor& k_code_pages,
+                             torch::Tensor& k_scale_pages,
+                             torch::Tensor& k_zero_pages,
+                             torch::Tensor& v_code_pages,
+                             torch::Tensor& v_scale_pages,
+                             torch::Tensor& v_zero_pages,
+                             torch::Tensor& k_residual_scratch,
+                             torch::Tensor& v_residual_scratch,
+                             int64_t num_queries, torch::Tensor& out);
+
+void kivi_cache_write_batched_dsl(torch::Tensor& k_code_pages,
+                                  torch::Tensor& k_scale_pages,
+                                  torch::Tensor& k_zero_pages,
+                                  torch::Tensor& v_code_pages,
+                                  torch::Tensor& v_scale_pages,
+                                  torch::Tensor& v_zero_pages,
+                                  torch::Tensor& k_residual_scratch,
+                                  torch::Tensor& v_residual_scratch,
+                                  torch::Tensor& new_k,
+                                  torch::Tensor& new_v,
+                                  torch::Tensor& slot_mapping,
+                                  torch::Tensor& block_table,
+                                  int64_t start_seq_len,
+                                  int64_t num_new);
+
+void kivi_cache_write_batched_jac_dsl(torch::Tensor& k_code_pages,
+                                      torch::Tensor& k_scale_pages,
+                                      torch::Tensor& k_zero_pages,
+                                      torch::Tensor& v_code_pages,
+                                      torch::Tensor& v_scale_pages,
+                                      torch::Tensor& v_zero_pages,
+                                      torch::Tensor& k_residual_scratch,
+                                      torch::Tensor& v_residual_scratch,
+                                      torch::Tensor& new_k,
+                                      torch::Tensor& new_v,
+                                      torch::Tensor& slot_mapping,
+                                      torch::Tensor& block_table,
+                                      int64_t start_seq_len,
+                                      int64_t num_new);
+
+void kivi_cache_write_jac_dsl(torch::Tensor& k_code_pages,
+                              torch::Tensor& k_scale_pages,
+                              torch::Tensor& k_zero_pages,
+                              torch::Tensor& v_code_pages,
+                              torch::Tensor& v_scale_pages,
+                              torch::Tensor& v_zero_pages,
+                              torch::Tensor& k_residual_scratch,
+                              torch::Tensor& v_residual_scratch,
+                              torch::Tensor& new_k,
+                              torch::Tensor& new_v,
+                              torch::Tensor& slot_mapping,
+                              torch::Tensor& block_table,
+                              int64_t seq_len);
+
+void paged_attention_v1(
+'''
+    return _replace_once(text, old, new, "csrc/ops.h")
+
+
+def _patch_torch_bindings(text: str) -> str:
+    old = '''  ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);
+'''
+    new = '''  ops.impl("paged_attention_v1", torch::kCUDA, &paged_attention_v1);
+
+  ops.def(
+      "kivi_decode_dsl("
+      "    Tensor Q, Tensor BLOCK_TABLE, Tensor K_CODE_PAGES,"
+      "    Tensor K_SCALE_PAGES, Tensor K_ZERO_PAGES,"
+      "    Tensor V_CODE_PAGES, Tensor V_SCALE_PAGES,"
+      "    Tensor V_ZERO_PAGES,"
+      "    Tensor K_RESIDUAL_SCRATCH, Tensor V_RESIDUAL_SCRATCH,"
+      "    int SEQ_LEN, Tensor! O) -> ()");
+  ops.impl("kivi_decode_dsl", torch::kCUDA, &kivi_decode_dsl);
+
+  ops.def(
+      "kivi_decode_sparse_retained_dsl("
+      "    Tensor Q, Tensor RETAINED_BLOCK_TABLE, Tensor K_CODE_PAGES,"
+      "    Tensor K_SCALE_PAGES, Tensor K_ZERO_PAGES,"
+      "    Tensor V_CODE_PAGES, Tensor V_SCALE_PAGES,"
+      "    Tensor V_ZERO_PAGES,"
+      "    Tensor K_RESIDUAL_SCRATCH, Tensor V_RESIDUAL_SCRATCH,"
+      "    int SEQ_LEN, int NUM_RETAINED_PAGES, Tensor! O) -> ()");
+  ops.impl("kivi_decode_sparse_retained_dsl", torch::kCUDA,
+           &kivi_decode_sparse_retained_dsl);
+
+  ops.def(
+      "kivi_cache_write_dsl("
+      "    Tensor! K_CODE_PAGES, Tensor! K_SCALE_PAGES, Tensor! K_ZERO_PAGES,"
+      "    Tensor! V_CODE_PAGES, Tensor! V_SCALE_PAGES, Tensor! V_ZERO_PAGES,"
+      "    Tensor! K_RESIDUAL_SCRATCH, Tensor! V_RESIDUAL_SCRATCH,"
+      "    Tensor NEW_K, Tensor NEW_V, Tensor SLOT_MAPPING,"
+      "    Tensor BLOCK_TABLE, int SEQ_LEN) -> ()");
+  ops.impl("kivi_cache_write_dsl", torch::kCUDA, &kivi_cache_write_dsl);
+
+  ops.def(
+      "kivi_decode_batched_dsl("
+      "    Tensor Q, Tensor SEQ_LENS, Tensor BLOCK_TABLE, Tensor K_CODE_PAGES,"
+      "    Tensor K_SCALE_PAGES, Tensor K_ZERO_PAGES,"
+      "    Tensor V_CODE_PAGES, Tensor V_SCALE_PAGES,"
+      "    Tensor V_ZERO_PAGES,"
+      "    Tensor K_RESIDUAL_SCRATCH, Tensor V_RESIDUAL_SCRATCH,"
+      "    int NUM_QUERIES, Tensor! O) -> ()");
+  ops.impl("kivi_decode_batched_dsl", torch::kCUDA, &kivi_decode_batched_dsl);
+
+  ops.def(
+      "kivi_cache_write_batched_dsl("
+      "    Tensor! K_CODE_PAGES, Tensor! K_SCALE_PAGES, Tensor! K_ZERO_PAGES,"
+      "    Tensor! V_CODE_PAGES, Tensor! V_SCALE_PAGES, Tensor! V_ZERO_PAGES,"
+      "    Tensor! K_RESIDUAL_SCRATCH, Tensor! V_RESIDUAL_SCRATCH,"
+      "    Tensor NEW_K, Tensor NEW_V, Tensor SLOT_MAPPING,"
+      "    Tensor BLOCK_TABLE, int START_SEQ_LEN, int NUM_NEW) -> ()");
+  ops.impl("kivi_cache_write_batched_dsl", torch::kCUDA, &kivi_cache_write_batched_dsl);
+
+  // Comparison op: NOT wired into the request loop, exists only so a GPU
+  // bitcheck harness can call both this and kivi_cache_write_dsl on identical
+  // input state and compare output tensors directly.
+  ops.def(
+      "kivi_cache_write_jac_dsl("
+      "    Tensor! K_CODE_PAGES, Tensor! K_SCALE_PAGES, Tensor! K_ZERO_PAGES,"
+      "    Tensor! V_CODE_PAGES, Tensor! V_SCALE_PAGES, Tensor! V_ZERO_PAGES,"
+      "    Tensor! K_RESIDUAL_SCRATCH, Tensor! V_RESIDUAL_SCRATCH,"
+      "    Tensor NEW_K, Tensor NEW_V, Tensor SLOT_MAPPING,"
+      "    Tensor BLOCK_TABLE, int SEQ_LEN) -> ()");
+  ops.impl("kivi_cache_write_jac_dsl", torch::kCUDA, &kivi_cache_write_jac_dsl);
+
+
+  // Batched DSL writer bitcheck op: comparison-only, not request-loop wired.
+  ops.def(
+      "kivi_cache_write_batched_jac_dsl("
+      "    Tensor! K_CODE_PAGES, Tensor! K_SCALE_PAGES, Tensor! K_ZERO_PAGES,"
+      "    Tensor! V_CODE_PAGES, Tensor! V_SCALE_PAGES, Tensor! V_ZERO_PAGES,"
+      "    Tensor! K_RESIDUAL_SCRATCH, Tensor! V_RESIDUAL_SCRATCH,"
+      "    Tensor NEW_K, Tensor NEW_V, Tensor SLOT_MAPPING,"
+      "    Tensor BLOCK_TABLE, int START_SEQ_LEN, int NUM_NEW) -> ()");
+  ops.impl("kivi_cache_write_batched_jac_dsl", torch::kCUDA, &kivi_cache_write_batched_jac_dsl);
+'''
+    text = _replace_once(text, old, new, "csrc/torch_bindings.cpp")
+
+    # PyTorch 2.6 makes ``torch::kCUDA`` resolve through the DeviceType
+    # overload, which on source-built configurations has registered CUDA
+    # custom ops under the CPU dispatch key so they fail at dispatch time.
+    # Use explicit DispatchKey values for this CUDA binding TU so the CUDA
+    # ops deterministically register under the CUDA key and remain callable.
+    text = text.replace("torch::kCUDA", "c10::DispatchKey::CUDA")
+    text = text.replace("torch::kCPU", "c10::DispatchKey::CPU")
+    return text
+
+
+def _patch_flash_attn(text: str) -> str:
+    text = _replace_once(
+        text,
+        "from vllm import _custom_ops as ops\n",
+        "from vllm import _custom_ops as ops\nimport os\nfrom vllm.v1.attention.backends.kivi_dsl import (get_sparse_retained_metadata, launch_kivi_dsl_decode, launch_kivi_dsl_decode_batched, launch_kivi_dsl_decode_sparse_retained, mark_scheduler_reuse_from_block_table, plan_batched_write, require_kivi_cache_write, require_kivi_cache_write_batched, retained_block_table_tensor, sparse_decode_enabled)\n",
+        "vllm/v1/attention/backends/flash_attn.py",
+    )
+
+    # Two new metadata fields the KIVI decode path needs; see the
+    # assign_slots_with_reclaim for the full design + the safety argument.
+    old_metadata_fields = '''    local_attn_metadata: Optional[LocalAttentionMetadata] = None
+'''
+    new_metadata_fields = '''    local_attn_metadata: Optional[LocalAttentionMetadata] = None
+
+    # Row-ordered logical request ids for this step (SAME row
+    # order as query_start_loc/seq_lens/block_table above -- all sourced
+    # from the same InputBatch state at metadata-build time) plus the set
+    # of request ids vLLM reported finished THIS step. Threaded through so
+    # the KIVI decode lane's residual-slot allocator can key by stable
+    # logical identity (never reused by vLLM for a still-open request)
+    # instead of a physical block id (which vLLM's own memory manager DOES
+    # recycle), and reclaim a slot the moment a request finishes instead of
+    # leaking it forever. The reclaim-before-assign ordering used in the
+    # decode lane cannot race a still-live request: execute_model() calls
+    # _update_states (which drops finished requests from InputBatch)
+    # FIRST, every step, before this step's attention metadata is built
+    # (see the residual-slot comment in the decode lane below).
+    # Optional/defaulted: unused on non-KIVI layers, zero cost when unread.
+    req_ids: Optional[list[str]] = None
+    finished_req_ids: Optional[set[str]] = None
+    active_req_ids: Optional[set[str]] = None
+    # Scheduler-created sparse-retained metadata must cross the
+    # TP=2 process boundary.  The scheduler/core process owns page compaction;
+    # worker processes execute attention and cannot see a module-local registry.
+    sparse_retained_metadata_by_req_id: Optional[dict[str, Any]] = None
+'''
+    text = _replace_once(text, old_metadata_fields, new_metadata_fields,
+                         "vllm/v1/attention/backends/flash_attn.py")
+    # Thread req_ids/finished_req_ids onto the metadata object the
+    # builder returns (see the FlashAttentionMetadata field comment above).
+    old_build_return = '''            local_attn_metadata=local_attn_metadata,
+            prefix_scheduler_metadata=prefix_scheduler_metadata,
+        )
+        return attn_metadata'''
+    new_build_return = '''            local_attn_metadata=local_attn_metadata,
+            prefix_scheduler_metadata=prefix_scheduler_metadata,
+            req_ids=list(self.runner.input_batch.req_ids[:num_reqs]),
+            finished_req_ids=getattr(
+                self.runner, "_kivi_finished_req_ids_this_step", None),
+            active_req_ids=set(self.runner.input_batch.req_id_to_index.keys()),
+            sparse_retained_metadata_by_req_id=dict(getattr(
+                self.runner, "_kivi_sparse_metadata_by_req_id", {})),
+        )
+        return attn_metadata'''
+    text = _replace_once(text, old_build_return, new_build_return,
+                         "vllm/v1/attention/backends/flash_attn.py")
+
+    # __init__'s hardware-capability gate assumes any non-"auto" kv_cache_dtype
+    # is fp8 and needs fp8 flash-attn support. int4_kivi never reaches
+    # flash-attn's own fp8 codepath -- the forward() branch below intercepts
+    # it entirely with the DSL decode/writer ops -- so it must be exempted
+    # or engine construction raises before a single request is ever served.
+    old_init_check = '''        if is_quantized_kv_cache(self.kv_cache_dtype) \\
+            and not flash_attn_supports_fp8():
+            raise NotImplementedError(
+                "FlashAttention does not support fp8 kv-cache on this device.")
+'''
+    new_init_check = '''        if is_quantized_kv_cache(self.kv_cache_dtype) \\
+            and self.kv_cache_dtype != "int4_kivi" \\
+            and not flash_attn_supports_fp8():
+            raise NotImplementedError(
+                "FlashAttention does not support fp8 kv-cache on this device.")
+'''
+    text = _replace_once(text, old_init_check, new_init_check,
+                         "vllm/v1/attention/backends/flash_attn.py")
+
+    old = '''        num_actual_tokens = attn_metadata.num_actual_tokens
+        # Reshape the input keys and values and store them in the cache.
+'''
+    new = '''        num_actual_tokens = attn_metadata.num_actual_tokens
+        if isinstance(kv_cache, dict) and kv_cache.get("kind") == "int4_kivi_dsl_paged":
+            max_seqs = kv_cache["max_seqs"]
+            # attn_metadata.seq_lens/block_table are sized to NUM_REQS (one row
+            # per distinct request); num_actual_tokens is TOTAL SCHEDULED
+            # TOKENS across all of them (vLLM's own naming: GPUModelRunner
+            # builds it as `total_num_scheduled_tokens`, the sum of each
+            # request's individually-scheduled token count -- NOT a count of
+            # requests). These only coincide when every request contributes
+            # exactly one token this call (pure decode); a prefill chunk --
+            # even from a single request alone -- makes num_actual_tokens
+            # exceed num_reqs (the scheduler is given a total token BUDGET,
+            # not a one-token-per-request instruction), so the loops below
+            # must never index seq_lens/block_table by token count.
+            #
+            # attn_metadata.query_start_loc (length num_reqs+1, cumulative
+            # NEW-token count boundary per request -- vLLM's own real
+            # mechanism for this) maps between the per-request index space
+            # (seq_lens, block_table) and the per-token index space (query,
+            # key, value, slot_mapping): request j's tokens are rows
+            # query_start_loc[j]..query_start_loc[j+1] of the per-token
+            # tensors. Mirror this exact arithmetic (it is the
+            # torch-free planning reference used during development, not
+            # something vLLM derives for us); the batched-read assertions in
+            # the scaffold tests guard against drift.
+            num_reqs = attn_metadata.seq_lens.shape[0]
+            if num_reqs > max_seqs:
+                raise NotImplementedError(
+                    f"int4_kivi DSL decode lane got {num_reqs} concurrently-active "
+                    f"requests, more than max_num_reqs={max_seqs} residual/scratch "
+                    "slots were allocated for.")
+            if attn_metadata.use_cascade or attn_metadata.local_attn_metadata is not None:
+                raise NotImplementedError(
+                    "int4_kivi DSL decode lane does not support cascade/local attention")
+            # Residual/scratch slots must be keyed by something STABLE across
+            # a request's whole lifetime, not by attn_metadata's row index j
+            # ("this request's position within THIS call's batch"). vLLM
+            # reassigns row indices over a request's life: InputBatch.
+            # condense() (gpu_input_batch.py) moves a later-index active
+            # request into an earlier index vacated by a finished request,
+            # correctly updating vLLM's OWN block_table via move_row() -- but
+            # it has no way to know about these separate residual tensors.
+            # Row-index keying would let a request silently read another
+            # request's leftover residual state after a condense reshuffle.
+            # Physical-resource anchors (e.g. a request's first-ever
+            # allocated physical block id) are ALSO unstable: vLLM's own
+            # memory manager recycles physical block ids once a request
+            # finishes and frees its blocks, so a later request assigned the
+            # same recycled id would silently inherit the earlier request's
+            # stale residual state.
+            #
+            # The stable key is vLLM's own LOGICAL req_id (a string assigned
+            # once at request admission, never reused by vLLM's own engine
+            # for a still-open request), with slots reclaimed the instant
+            # SchedulerOutput.finished_req_ids reports the request done
+            # (threaded onto attn_metadata by
+            # FlashAttentionMetadataBuilder.build(), see the field comment
+            # on FlashAttentionMetadata above and the _update_states patch
+            # in _patch_gpu_model_runner). Reclaim-before-assign ordering
+            # cannot race a still-live request: GPUModelRunner.
+            # execute_model() calls _update_states(scheduler_output) FIRST,
+            # every step, which removes every finished_req_ids entry from
+            # input_batch BEFORE this same step's attention metadata (and
+            # therefore req_ids, below) gets built -- verified directly
+            # against this pinned vLLM commit's source. The reclaim below
+            # also reconciles against the post-update active request map
+            # every step, so a request that finishes on a step with no
+            # subsequent attention work still gets its slot freed.
+            # Read every per-request scalar we need in as few batched,
+            # tensor-wide device syncs as possible -- 2 here:
+            # query_start_loc and seq_lens. req_ids needs no device read at
+            # all (it is already a plain Python list built at
+            # metadata-construction time; see the field comment on
+            # FlashAttentionMetadata above). All reads happen before any
+            # per-request work begins, for two reasons: (1) per-request
+            # .item() calls multiply synchronous CPU<->GPU round trips (this
+            # loop needs 3 scalars per request, across a 64-layer model);
+            # (2) interleaving single-value reads with per-request kernel
+            # launches maximizes the window in which attn_metadata's
+            # underlying buffers could change underneath the loop -- batched
+            # reads shrink that window to the minimum possible.
+            query_start_loc_list = attn_metadata.query_start_loc.tolist()
+            seq_lens_list = attn_metadata.seq_lens.tolist()
+            req_ids = attn_metadata.req_ids
+            served_sparse_decode_enabled = sparse_decode_enabled()
+            sparse_metadata_by_req_id = attn_metadata.sparse_retained_metadata_by_req_id or {}
+            current_req_id_set = set(req_ids)
+            slot_by_req_id = kv_cache.setdefault("_slot_by_req_id", {})
+            free_slots = kv_cache.setdefault("_free_residual_slots", [])
+            for finished_id in (attn_metadata.finished_req_ids or ()):
+                freed_slot = slot_by_req_id.pop(finished_id, None)
+                if freed_slot is not None:
+                    free_slots.append(freed_slot)
+            # Live-engine fix: a request can finish on a step that has
+            # no subsequent attention work, so SchedulerOutput.finished_req_ids
+            # may be consumed by GPUModelRunner without this layer ever seeing
+            # that exact finished set. Reconcile against vLLM's post-update
+            # active request map every attention step; this is conservative
+            # (only requests no longer in InputBatch are reclaimed) and closes
+            # stale slot leaks between waves.
+            active_req_ids = attn_metadata.active_req_ids
+            if active_req_ids is not None:
+                for stale_id in list(slot_by_req_id.keys()):
+                    if stale_id not in active_req_ids:
+                        free_slots.append(slot_by_req_id.pop(stale_id))
+            slots = []
+            for req_id in req_ids:
+                slot = slot_by_req_id.get(req_id)
+                if slot is None:
+                    if free_slots:
+                        slot = free_slots.pop()
+                    elif len(slot_by_req_id) < max_seqs:
+                        slot = len(slot_by_req_id)
+                    else:
+                        # Last-chance pressure reclaim: in live serving a request
+                        # can finish without a later attention step carrying its
+                        # finished_req_ids. If vLLM admits a new request and our
+                        # map is still full, any mapped id absent from this
+                        # scheduled forward cannot be part of the max_num_seqs
+                        # current batch; free it before declaring exhaustion.
+                        for stale_id in list(slot_by_req_id.keys()):
+                            if stale_id not in current_req_id_set:
+                                free_slots.append(slot_by_req_id.pop(stale_id))
+                        if free_slots:
+                            slot = free_slots.pop()
+                        elif len(slot_by_req_id) < max_seqs:
+                            slot = len(slot_by_req_id)
+                        else:
+                            raise NotImplementedError(
+                                f"int4_kivi DSL decode lane ran out of residual slots "
+                                f"(max_seqs={max_seqs}) even after reclaim; "
+                                f"{len(slot_by_req_id)} distinct requests concurrently "
+                                "assigned and 0 free -- this should be unreachable "
+                                "under vLLM's own admission control (max_num_seqs "
+                                "caps concurrent requests at max_seqs); if this "
+                                "fires, a reclaim was missed somewhere, this is not "
+                                "the lifetime-request-count limit fixed above.")
+                    slot_by_req_id[req_id] = slot
+                slots.append(slot)
+            # PERSISTENT buffer (allocated once at KV-cache-init time, sized
+            # to vLLM's own max_num_batched_tokens), NOT a fresh torch.empty()
+            # per call -- see kivi_cache_tensor_shapes's DSL_OUT_SCRATCH
+            # docstring for why a transient allocation here is structurally
+            # invisible to vLLM's own memory profiler.
+            dsl_out = kv_cache["DSL_OUT_SCRATCH"][:num_actual_tokens]
+            for j in range(num_reqs):
+                # BLOCK_TABLE is vLLM's real scheduler-assigned table for
+                # THIS request, used for BOTH the writer and decode: both
+                # sides must resolve the identical
+                # vLLM-scheduler-guaranteed-distinct-per-sequence physical
+                # page for a given logical page (see
+                # KIVI_CACHE_WRITE_SOURCE's kivi_cache_write_launch) --
+                # that shared real table is what buys collision-freedom
+                # across concurrent requests, not a private per-bundle
+                # counter.
+                # Row index j is correct HERE (unlike for residual slots):
+                # vLLM keeps its own block_table consistent with row index
+                # via condense()'s move_row(), so block_table[j] always
+                # belongs to whichever request currently sits at row j.
+                # This one stays a GPU tensor slice (not read via .item()/
+                # tolist() above) -- the writer/decode ops need the actual
+                # device pointer, not its values.
+                block_table = attn_metadata.block_table[j]
+                req_id = req_ids[j]
+                sparse_metadata = None
+                retained_block_table = None
+                num_retained_pages = 0
+                dense_old_pages = 0
+                sparse_decode_this_request = served_sparse_decode_enabled
+                tok_start = query_start_loc_list[j]
+                tok_end = query_start_loc_list[j + 1]
+                num_tok_this_req = tok_end - tok_start
+                final_seq_len = seq_lens_list[j]
+                start_seq_len = final_seq_len - num_tok_this_req
+                if served_sparse_decode_enabled:
+                    sparse_metadata = sparse_metadata_by_req_id.get(req_id) or get_sparse_retained_metadata(req_id)
+                    if sparse_metadata is None:
+                        if start_seq_len == 0 and num_tok_this_req > 0:
+                            # Organic page-aware metadata cannot exist before
+                            # the first prefill has written the request's old
+                            # KIVI pages.  Defer sparse decode for exactly this
+                            # initial multi-token prefill; the scheduler-side
+                            # page-aware hook must construct metadata before a
+                            # later decode step.  Missing metadata after that
+                            # still fails closed below.
+                            sparse_decode_this_request = False
+                        else:
+                            raise RuntimeError(
+                                "JAC_KIVI_SPARSE_RETAINED_DECODE=1 but no "
+                                f"sparse_retained_block_table metadata exists for request {req_id}; "
+                                "failing closed instead of silently using dense KIVI decode")
+                    # Served analog of the anti-silent-dense gate: mark
+                    # scheduler reuse from the real block table, then pass a
+                    # compact retained physical-page table to the sparse CUDA op.
+                    if sparse_decode_this_request:
+                        sparse_metadata = mark_scheduler_reuse_from_block_table(req_id, block_table, sparse_metadata) or sparse_metadata
+                        retained_block_table, num_retained_pages = retained_block_table_tensor(
+                            sparse_metadata, device=query.device)
+                        dense_old_pages = int(
+                            sparse_metadata.get("sparse_retained_block_table", sparse_metadata).get(
+                                "original_pages", 0))
+                # Residual/scratch has no BLOCK_TABLE indirection (it is a
+                # flat per-request buffer, see kivi_cache_tensor_shapes) --
+                # slice this request's STABLE slot (see above; NOT row index
+                # j) before calling the op. Indexing away a contiguous
+                # tensor's leading dim produces a contiguous view, so the
+                # CUDA kernels see the exact same [NKV, ...] shape as the
+                # single-sequence first lane; no kernel or JAC_LAUNCH ABI
+                # change needed for this slicing.
+                # Deliberately NOT wrapped in .contiguous(): these tensors are
+                # mutated in-place by the CUDA writer op (torch::Tensor&), and
+                # .contiguous() silently substitutes a detached COPY whenever
+                # its input isn't already contiguous -- the write would land
+                # in that copy and never reach the real persistent cache,
+                # a silent-corruption failure mode worse than the one being
+                # guarded against. Trust the plain slice (a contiguous
+                # tensor's leading-dim integer index is itself contiguous,
+                # standard PyTorch semantics) and let check_cuda_tensor's own
+                # is_contiguous() TORCH_CHECK fail loud if that's ever wrong.
+                slot = slots[j]
+                seq_cache = dict(kv_cache)
+                seq_cache["K_RESIDUAL_SCRATCH"] = kv_cache["K_RESIDUAL_SCRATCH"][slot]
+                seq_cache["V_RESIDUAL_SCRATCH"] = kv_cache["V_RESIDUAL_SCRATCH"][slot]
+                # A request contributing more than one token this call (a
+                # prefill chunk) needs one write+decode CALL PER TOKEN, in
+                # order: kivi_cache_write_launch is built for "append exactly
+                # one new token" (prev_seq_len = seq_len - 1) and decode
+                # reads whatever the writer has written so far, so processing
+                # a multi-token chunk as N sequential single-token calls is
+                # the causally-correct generalization of the existing
+                # single-token op, not a new kernel capability -- slower
+                # (N sequential launches instead of one batched kernel) but
+                # correct, matching this lane's correctness-first scope.
+                #
+                # An opt-in batched alternative exists
+                # (JAC_KIVI_BATCHED_PREFILL=1), defaulting OFF so this
+                # per-token path keeps serving by default. The batched
+                # kernels' parity with the single-token kernels is NOT
+                # established in this repository, and this exact call-site
+                # wiring has not been measured end-to-end -- the flag exists
+                # so that measurement can happen without replacing the
+                # working default.
+                if os.environ.get("JAC_KIVI_BATCHED_PREFILL") == "1":
+                    if sparse_decode_this_request:
+                        raise NotImplementedError(
+                            "served sparse-retained KIVI decode does not yet support "
+                            "JAC_KIVI_BATCHED_PREFILL=1; failing closed instead of "
+                            "falling back to dense batched decode")
+                    stream = torch.cuda.current_stream(query.device)
+                    for sub_chunk in plan_batched_write(start_seq_len, num_tok_this_req):
+                        # A sub-chunk that ages out a page does so at its OWN LAST token
+                        # (plan_batched_write's construction). Every token BEFORE that
+                        # last one has a seq_len whose residual-window formula assumes
+                        # scratch is still in its pre-shift layout -- but batching write
+                        # (which performs the shift) then decode for the WHOLE sub-chunk
+                        # would let those earlier tokens' decode run only after the
+                        # shift already happened, so they'd read post-shift positions
+                        # instead of their own. Split into "every token except the one
+                        # that ages out" (safe to batch -- no shift yet) + "the aging-out
+                        # token alone" (decodes only after ITS OWN write/shift);
+                        # without the split, every earlier token in an
+                        # aging-out sub-chunk would decode against
+                        # post-shift positions.
+                        if sub_chunk.age_out_page is not None and sub_chunk.num_new > 1:
+                            splits = [
+                                (sub_chunk.start_seq_len, sub_chunk.num_new - 1),
+                                (sub_chunk.start_seq_len + sub_chunk.num_new - 1, 1),
+                            ]
+                        else:
+                            splits = [(sub_chunk.start_seq_len, sub_chunk.num_new)]
+                        for split_start, split_num in splits:
+                            split_start_tok = tok_start + (split_start - start_seq_len)
+                            split_end_tok = split_start_tok + split_num
+                            require_kivi_cache_write_batched(
+                                key=key[split_start_tok:split_end_tok],
+                                value=value[split_start_tok:split_end_tok],
+                                slot_mapping=attn_metadata.slot_mapping[split_start_tok:split_end_tok],
+                                block_table=block_table,
+                                cache=seq_cache,
+                                start_seq_len=split_start,
+                                num_new=split_num,
+                            )
+                            seq_lens_split = torch.arange(
+                                split_start + 1, split_start + 1 + split_num,
+                                dtype=torch.int32, device=query.device,
+                            )
+                            launch_kivi_dsl_decode_batched(
+                                q=query[split_start_tok:split_end_tok],
+                                seq_lens=seq_lens_split,
+                                block_table=block_table,
+                                cache=seq_cache,
+                                out=dsl_out[split_start_tok:split_end_tok],
+                                num_queries=split_num,
+                                stream=stream,
+                            )
+                    continue
+                for local_tok in range(num_tok_this_req):
+                    tok_row = tok_start + local_tok
+                    this_seq_len = start_seq_len + local_tok + 1
+                    require_kivi_cache_write(
+                        key=key[tok_row],
+                        value=value[tok_row],
+                        slot_mapping=attn_metadata.slot_mapping[tok_row:tok_row + 1],
+                        block_table=block_table,
+                        cache=seq_cache,
+                        seq_len=this_seq_len,
+                    )
+                    if sparse_decode_this_request:
+                        launch_kivi_dsl_decode_sparse_retained(
+                            q=query[tok_row],
+                            retained_block_table=retained_block_table,
+                            cache=seq_cache,
+                            out=dsl_out[tok_row],
+                            seq_len=this_seq_len,
+                            num_retained_pages=num_retained_pages,
+                            request_id=req_id,
+                            sparse_metadata=sparse_metadata,
+                            dense_old_pages=dense_old_pages,
+                            stream=torch.cuda.current_stream(query.device),
+                        )
+                    else:
+                        launch_kivi_dsl_decode(
+                            q=query[tok_row],
+                            block_table=block_table,
+                            cache=seq_cache,
+                            out=dsl_out[tok_row],
+                            seq_len=this_seq_len,
+                            stream=torch.cuda.current_stream(query.device),
+                        )
+            # output's real runtime shape here is [num_tokens, num_heads,
+            # head_size] (3D), not the flattened [num_tokens, num_heads *
+            # head_size] the module docstring describes -- reshape to match
+            # the actual destination rather than assume either convention;
+            # element count (num_heads * head_size) is the same regardless.
+            n = num_actual_tokens
+            output[:n].copy_(dsl_out.reshape(output[:n].shape).to(output.dtype))
+            return output
+        # Reshape the input keys and values and store them in the cache.
+'''
+    return _replace_once(text, old, new, "vllm/v1/attention/backends/flash_attn.py")
+
+
+def _patch_arg_utils(text: str) -> str:
+    # The V1-engine eligibility oracle only allowlists fp8-family
+    # kv_cache_dtype values; int4_kivi is neither "auto" nor "fp8*", so it
+    # silently fell back to the unpatched V0 engine. V0 never touches any of
+    # the patched V1 files above, so this was a measurement-integrity hole,
+    # not just a missing feature: every request would have looked like it
+    # "worked" while never running the KIVI path at all.
+    old = '''        # No Fp8 KV cache so far.
+        if self.kv_cache_dtype != "auto":
+            fp8_attention = self.kv_cache_dtype.startswith("fp8")
+            will_use_fa = (
+                current_platform.is_cuda()
+                and not envs.is_set("VLLM_ATTENTION_BACKEND")
+            ) or envs.VLLM_ATTENTION_BACKEND == "FLASH_ATTN_VLLM_V1"
+            supported = False
+            if fp8_attention and will_use_fa:
+                from vllm.attention.utils.fa_utils import (
+                    flash_attn_supports_fp8)
+                supported = flash_attn_supports_fp8()
+            if not supported:
+                _raise_or_fallback(feature_name="--kv-cache-dtype",
+                                   recommend_to_remove=False)
+                return False
+'''
+    new = '''        # No Fp8 KV cache so far.
+        if self.kv_cache_dtype != "auto":
+            fp8_attention = self.kv_cache_dtype.startswith("fp8")
+            is_int4_kivi = self.kv_cache_dtype == "int4_kivi"
+            will_use_fa = (
+                current_platform.is_cuda()
+                and not envs.is_set("VLLM_ATTENTION_BACKEND")
+            ) or envs.VLLM_ATTENTION_BACKEND == "FLASH_ATTN_VLLM_V1"
+            supported = False
+            if fp8_attention and will_use_fa:
+                from vllm.attention.utils.fa_utils import (
+                    flash_attn_supports_fp8)
+                supported = flash_attn_supports_fp8()
+            elif is_int4_kivi:
+                # jacq KIVI-vLLM integration: the source-patched V1
+                # FlashAttentionImpl has a dedicated int4_kivi decode/writer
+                # branch. There is no V0 KIVI implementation, so int4_kivi
+                # must be explicitly allowed here or every request silently
+                # falls back to unpatched V0 and never touches the KIVI path.
+                supported = True
+            if not supported:
+                _raise_or_fallback(feature_name="--kv-cache-dtype",
+                                   recommend_to_remove=False)
+                return False
+'''
+    return _replace_once(text, old, new, "vllm/engine/arg_utils.py")
+
+
+def _patch_specialized_manager(text: str) -> str:
+    # KVCacheManager dispatches on the KV-cache spec's exact type via a
+    # closed dict; KiviFullAttentionSpec was never registered, so scheduler
+    # construction raised KeyError before any request could even be
+    # scheduled. FullAttentionManager only does abstract block-hash
+    # prefix-cache bookkeeping and never evicts for full attention -- it
+    # never touches the physical tensor layout, so it is the semantically
+    # correct manager for KIVI's custom page layout too, not a stand-in.
+    text = _replace_once(
+        text,
+        "from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheSpec,\n"
+        "                                        SlidingWindowSpec)",
+        "from vllm.v1.kv_cache_interface import (FullAttentionSpec,\n"
+        "                                        KiviFullAttentionSpec, KVCacheSpec,\n"
+        "                                        SlidingWindowSpec)",
+        "vllm/v1/core/specialized_manager.py",
+    )
+    old_map = '''spec_manager_map: dict[type[KVCacheSpec], type[SpecializedManager]] = {
+    FullAttentionSpec: FullAttentionManager,
+    SlidingWindowSpec: SlidingWindowManager,
+}'''
+    new_map = '''spec_manager_map: dict[type[KVCacheSpec], type[SpecializedManager]] = {
+    FullAttentionSpec: FullAttentionManager,
+    SlidingWindowSpec: SlidingWindowManager,
+    KiviFullAttentionSpec: FullAttentionManager,
+}'''
+    return _replace_once(text, old_map, new_map, "vllm/v1/core/specialized_manager.py")
+
+
+def _patch_kv_cache_manager(text: str) -> str:
+    text = _replace_once(
+        text,
+        "from vllm.v1.core.block_pool import BlockPool",
+        "from vllm.v1.core.block_pool import BlockPool\n"
+        "from vllm.v1.core.kivi_page_aware_allocator import apply_page_aware_drop_to_vllm_blocks",
+        "vllm/v1/core/kv_cache_manager.py",
+    )
+    old = '''    def free(self, request: Request) -> None:
+        """Free the blocks allocated for the request.'''
+    new = '''    def apply_kivi_page_aware_drop(
+        self,
+        request_id: str,
+        original_pages: int,
+        kept_pages: list[int],
+        freed_pages: list[int],
+    ) -> dict[str, object]:
+        """Return dropped KIVI whole pages to BlockPool and compact retained pages.
+
+        This is the live allocator half of jacq's page_aware_snapkv_pagedrop_v0
+        lane.  The caller must only use it together with a sparse retained-page
+        KIVI decode table; otherwise removing middle pages would make the old
+        dense block_table semantics incorrect.  Capacity claims still require
+        downstream telemetry showing scheduler reuse of the returned blocks.
+        """
+        evidence = apply_page_aware_drop_to_vllm_blocks(
+            request_id=request_id,
+            req_blocks=self.req_to_blocks[request_id],
+            block_pool=self.block_pool,
+            original_pages=original_pages,
+            kept_pages=kept_pages,
+            freed_pages=freed_pages,
+            req_to_block_hashes=self.req_to_block_hashes,
+            num_cached_block=self.num_cached_block,
+        )
+        return evidence
+
+    def free(self, request: Request) -> None:
+        """Free the blocks allocated for the request.'''
+    return _replace_once(text, old, new, "vllm/v1/core/kv_cache_manager.py")
+
+
+PATCHERS: dict[str, Callable[[str], str]] = {
+    "CMakeLists.txt": _patch_cmake,
+    "vllm/config.py": _patch_config,
+    "vllm/utils.py": _patch_utils,
+    "vllm/v1/kv_cache_interface.py": _patch_kv_cache_interface,
+    "vllm/v1/worker/gpu_model_runner.py": _patch_gpu_model_runner,
+    "vllm/v1/core/sched/output.py": _patch_sched_output,
+    "vllm/v1/core/sched/scheduler.py": _patch_scheduler,
+    "vllm/v1/attention/backends/flash_attn.py": _patch_flash_attn,
+    "csrc/ops.h": _patch_ops_h,
+    "csrc/torch_bindings.cpp": _patch_torch_bindings,
+    "vllm/engine/arg_utils.py": _patch_arg_utils,
+    "vllm/v1/core/specialized_manager.py": _patch_specialized_manager,
+    "vllm/v1/core/kv_cache_manager.py": _patch_kv_cache_manager,
+}
+
+
+def inspect_checkout(root: Path) -> dict[str, object]:
+    files: dict[str, object] = {}
+    ok = True
+    for rel, anchors in ANCHORS.items():
+        path = root / rel
+        text = path.read_text() if path.exists() else ""
+        anchor_hits = {anchor: text.count(anchor) for anchor in anchors}
+        file_ok = path.exists() and all(count == 1 for count in anchor_hits.values())
+        files[rel] = {"exists": path.exists(), "anchor_hits": anchor_hits, "ok": file_ok}
+        ok = ok and file_ok
+    for rel in ADDED_FILES:
+        path = root / rel
+        files[rel] = {
+            "exists": path.exists(),
+            "ok": not path.exists(),
+            "action": "create",
+        }
+    layout = KiviPageLayout(KiviModelGeometry.qwen25_coder_32b()).to_abi_dict()
+    return {
+        "target": "vllm 0.8.5 source scaffold for int4_kivi",
+        "expected_vllm_head": EXPECTED_VLLM_085_HEAD,
+        "ok_to_apply_scaffold": ok,
+        "files": files,
+        "layout_abi": layout,
+        "binding_abi": default_qwen32b_binding_abi().to_report(),
+        "remaining_hard_blockers_after_scaffold": [
+            "GPU bitcheck torch.ops._C.kivi_decode_dsl against kivi_pack before enabling served results",
+            "GPU bitcheck torch.ops._C.kivi_decode_sparse_retained_dsl against reference_sparse_retained_attention before enabling page-aware sparse decode",
+            "torch.ops._C.kivi_cache_write_jac_dsl carries no verification in this repository: a GPU bitcheck against the hand-CUDA single-token writer plus served one-token parity are required before defaulting JAC_KIVI_CACHE_WRITE_KERNEL=jac_dsl",
+            "generalized dynamic-residual lifecycle GPU validation across fill-from-empty, partial 129..159-token tails, age-out boundaries, and the 4095->4096 gate before broad multi-token serving claims",
+            "one-token parity and offline vLLM needle smoke before Phase-1 n=150",
+        ],
+    }
+
+
+def build_unified_diff(root: Path) -> str:
+    chunks: list[str] = []
+    for rel, patcher in PATCHERS.items():
+        path = root / rel
+        old = path.read_text()
+        new = patcher(old)
+        chunks.extend(difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        ))
+    for rel, text in ADDED_FILES.items():
+        chunks.extend(difflib.unified_diff(
+            [],
+            text.splitlines(keepends=True),
+            fromfile="/dev/null",
+            tofile=f"b/{rel}",
+        ))
+    diff = "".join(chunks)
+    # Keep the checked-in patch file `git diff --check` clean. The vLLM source
+    # diff contains blank context lines, which `difflib` represents as a single
+    # leading space; `git apply` accepts those lines stripped, and the scaffold
+    # does not intentionally add trailing whitespace anywhere.
+    lines = [line.rstrip() for line in diff.splitlines()]
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
+def apply_scaffold(root: Path) -> None:
+    report = inspect_checkout(root)
+    if not report["ok_to_apply_scaffold"]:
+        raise SystemExit(json.dumps(report, indent=2, sort_keys=True))
+    for rel, patcher in PATCHERS.items():
+        path = root / rel
+        path.write_text(patcher(path.read_text()))
+    for rel, text in ADDED_FILES.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--vllm-root", type=Path, required=True)
+    ap.add_argument("--json", action="store_true", help="print anchor/layout report")
+    ap.add_argument("--diff", action="store_true", help="print unified diff scaffold")
+    ap.add_argument("--apply", action="store_true", help="modify checkout in-place")
+    ap.add_argument(
+        "--preflight",
+        action="store_true",
+        help="run the fail-closed compatibility preflight (pinned git HEAD, "
+        "scaffold anchors, CUDA arch) and exit nonzero on failure",
+    )
+    ap.add_argument(
+        "--cuda-arch",
+        help="CUDA architecture for --preflight, e.g. sm_80 (A100) or sm_89 "
+        "(RTX 4090); auto-detected via nvidia-smi when available",
+    )
+    ap.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="TEST HARNESS ONLY: let --apply proceed without preflight against "
+        "a synthetic (non-git) checkout. Never use on a real vLLM checkout.",
+    )
+    args = ap.parse_args()
+    if args.preflight:
+        from integrations.vllm_kivi.preflight import run_preflight_cli
+
+        return run_preflight_cli(args.vllm_root, args.cuda_arch)
+    if args.json:
+        print(json.dumps(inspect_checkout(args.vllm_root), indent=2, sort_keys=True))
+    if args.diff:
+        print(build_unified_diff(args.vllm_root), end="")
+    if args.apply:
+        if not args.skip_preflight:
+            from integrations.vllm_kivi.preflight import preflight
+
+            report = preflight(args.vllm_root, args.cuda_arch)
+            if not report["ok"]:
+                print(json.dumps(report, indent=2, sort_keys=True))
+                raise SystemExit(
+                    "--apply: preflight failed (pinned HEAD / anchors / CUDA arch); "
+                    "fix the reported boundary before applying. (--skip-preflight "
+                    "is for synthetic test trees only.)"
+                )
+        apply_scaffold(args.vllm_root)
+    if not (args.json or args.diff or args.apply or args.preflight):
+        ap.error("choose at least one of --preflight/--json/--diff/--apply")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

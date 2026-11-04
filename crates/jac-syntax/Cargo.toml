@@ -1,0 +1,9 @@
+[package]
+name = "jac-syntax"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+logos = "0.14"

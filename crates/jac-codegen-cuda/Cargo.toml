@@ -1,0 +1,14 @@
+[package]
+name = "jac-codegen-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+jac-ir = { workspace = true }
+jac-syntax = { workspace = true }
+
+[dev-dependencies]
+jac-syntax = { workspace = true }
+jac-ir = { workspace = true }

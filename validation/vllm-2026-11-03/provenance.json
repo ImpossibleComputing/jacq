@@ -1,0 +1,51 @@
+{
+  "cuda_toolkit": "12.4.131",
+  "gpu": {
+    "compute_capability": "8.9",
+    "driver": "595.71.05",
+    "index": 1,
+    "name": "NVIDIA GeForce RTX 4090"
+  },
+  "model": {
+    "hidden_size": 5120,
+    "id": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
+    "num_attention_heads": 40,
+    "num_key_value_heads": 8,
+    "quantization": "AWQ 4-bit weights",
+    "snapshot": "eb3172f06a6d6b3a15f08947b0668d782e4d2d2c"
+  },
+  "python_version": "3.12.13",
+  "runs": [
+    {
+      "C_extension_sha256": "882ef8781d5dc5bb82968957de78ebc6805f8c3f56ce50986177c1e9a8bb45ff",
+      "chat_requests_per_arm": 1,
+      "completion_requests_per_arm": 15,
+      "configured_max_model_len": 4096,
+      "jacq_commit": "7f3711cc860dd78f9abf6ab0d2252a47e4ce209d",
+      "label": "original-7f3711c",
+      "raw_evidence_directory": "evidence"
+    },
+    {
+      "C_extension_sha256": "471da7e2038fe7ad4d80f4a9060a6cc786b079d0e40ecaf82b6d43c6367ebbde",
+      "chat_requests_per_arm": 1,
+      "completion_requests_per_arm": 7,
+      "configured_max_model_len": 512,
+      "jacq_commit": "112e2c8f4bd2f00c922ae549a2f5e4328c9c5347",
+      "label": "intermediate-112e2c8",
+      "raw_evidence_directory": "fixed-evidence"
+    },
+    {
+      "C_extension_sha256": "a39cdedc80b6d6473c8caacbcc722504528d6e8d26373e346e5f8c33f8ca4d68",
+      "chat_requests_per_arm": 1,
+      "completion_requests_per_arm": 7,
+      "configured_max_model_len": 512,
+      "jacq_commit": "b3965939f6c0b9037de0d027cd5898a2a8fcd3ff",
+      "label": "corrected-b396593",
+      "raw_evidence_directory": "old-pages-evidence"
+    }
+  ],
+  "torch_version": "2.6.0+cu124",
+  "transformers_version": "4.51.1",
+  "vllm_runtime_version": "0.8.5.post2.dev0+g3015d5634.d20261103",
+  "vllm_source_commit": "3015d5634e74d59704e2b39bab0dbe2e6f86a38a"
+}

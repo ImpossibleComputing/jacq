@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jac-cli",
+    "crates/jac-syntax",
+    "crates/jac-ir",
+    "crates/jac-codegen-cuda",
+]
+
+[workspace.package]
+version = "0.1.0-rc.1"
+edition = "2021"
+authors = ["Keith Ballinger <keithba@gmail.com>"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+jac-syntax = { path = "crates/jac-syntax" }
+jac-ir = { path = "crates/jac-ir" }
+jac-codegen-cuda = { path = "crates/jac-codegen-cuda" }

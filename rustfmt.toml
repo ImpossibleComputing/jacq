@@ -1,0 +1,10 @@
+# rustfmt configuration for the jacq workspace.
+#
+# Conservative, stable-only options. The goal is deterministic default
+# formatting enforced in CI, not a house style — see the `cargo fmt --all
+# --check` gate in .github/workflows/.
+#
+# `edition` matches [workspace.package].edition in Cargo.toml so formatting is
+# identical whether invoked via `cargo fmt` or a bare `rustfmt`.
+edition = "2021"
+newline_style = "Unix"

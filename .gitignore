@@ -1,0 +1,6 @@
+/target/
+/generated/
+/weights/
+__pycache__/
+*.pyc
+.venv/

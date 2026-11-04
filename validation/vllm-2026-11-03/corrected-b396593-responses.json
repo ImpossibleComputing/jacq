@@ -1,0 +1,229 @@
+{
+  "all_completion_fields_equal_to_baseline": true,
+  "arms": {
+    "baseline_fp16": {
+      "cache_dtype": "auto",
+      "chat_text": "READY",
+      "op_counts": {},
+      "requests": [
+        {
+          "case": "short_one",
+          "completion_tokens": 1,
+          "finish_reason": "length",
+          "max_tokens": 1,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue"
+        },
+        {
+          "case": "long_one",
+          "completion_tokens": 1,
+          "finish_reason": "length",
+          "max_tokens": 1,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The"
+        },
+        {
+          "case": "needle",
+          "completion_tokens": 8,
+          "finish_reason": "length",
+          "max_tokens": 8,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret code is LIME42"
+        },
+        {
+          "case": "wave_00",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue."
+        },
+        {
+          "case": "wave_01",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret"
+        },
+        {
+          "case": "wave_02",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue."
+        },
+        {
+          "case": "wave_03",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret"
+        }
+      ],
+      "status": "passed_requests",
+      "writer": "hand_cuda"
+    },
+    "kivi_hand_cuda": {
+      "cache_dtype": "int4_kivi",
+      "chat_text": "READY",
+      "op_counts": {
+        "cache_write:kivi_cache_write_dsl": 57744,
+        "kivi_decode_dsl": 57744
+      },
+      "requests": [
+        {
+          "case": "short_one",
+          "completion_tokens": 1,
+          "finish_reason": "length",
+          "max_tokens": 1,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue"
+        },
+        {
+          "case": "long_one",
+          "completion_tokens": 1,
+          "finish_reason": "length",
+          "max_tokens": 1,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The"
+        },
+        {
+          "case": "needle",
+          "completion_tokens": 8,
+          "finish_reason": "length",
+          "max_tokens": 8,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret code is LIME42"
+        },
+        {
+          "case": "wave_00",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue."
+        },
+        {
+          "case": "wave_01",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret"
+        },
+        {
+          "case": "wave_02",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue."
+        },
+        {
+          "case": "wave_03",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret"
+        }
+      ],
+      "status": "passed_requests",
+      "writer": "hand_cuda"
+    },
+    "kivi_jac_dsl": {
+      "cache_dtype": "int4_kivi",
+      "chat_text": "READY",
+      "op_counts": {
+        "cache_write:kivi_cache_write_jac_dsl": 57744,
+        "kivi_decode_dsl": 57744
+      },
+      "requests": [
+        {
+          "case": "short_one",
+          "completion_tokens": 1,
+          "finish_reason": "length",
+          "max_tokens": 1,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue"
+        },
+        {
+          "case": "long_one",
+          "completion_tokens": 1,
+          "finish_reason": "length",
+          "max_tokens": 1,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The"
+        },
+        {
+          "case": "needle",
+          "completion_tokens": 8,
+          "finish_reason": "length",
+          "max_tokens": 8,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret code is LIME42"
+        },
+        {
+          "case": "wave_00",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue."
+        },
+        {
+          "case": "wave_01",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret"
+        },
+        {
+          "case": "wave_02",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "Read this list carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue Answer with one word. The sky is",
+          "prompt_tokens": 93,
+          "text": " blue."
+        },
+        {
+          "case": "wave_03",
+          "completion_tokens": 2,
+          "finish_reason": "length",
+          "max_tokens": 2,
+          "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber entry32=amber entry33=amber entry34=amber entry35=amber entry36=amber entry37=amber entry38=amber entry39=amber entry40=amber entry41=amber Question: What is the secret code? Answer:",
+          "prompt_tokens": 219,
+          "text": " The secret"
+        }
+      ],
+      "status": "passed_requests",
+      "writer": "jac_dsl"
+    }
+  },
+  "configured_max_model_len": 512,
+  "jacq_commit": "b3965939f6c0b9037de0d027cd5898a2a8fcd3ff"
+}

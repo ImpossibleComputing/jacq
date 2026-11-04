@@ -1,0 +1,39 @@
+Jacq Inference
+Copyright 2026 Impossible Computing Inc.
+
+The Jacq compiler crates (jac-syntax, jac-ir, jac-codegen-cuda, jac-cli),
+kernel and model specifications, and KIVI/vLLM integration modules in this
+repository were selectively derived from Impossible Computing's internal
+Jacq project. Impossible Computing Inc. owns the copyright in this Jacq
+work and authorizes its release under the Apache License, Version 2.0
+(see LICENSE). Historical license labels in the private project's crate
+manifests do not describe this repository's authorized release.
+
+Keith Ballinger is credited as the original author of Jacq, alongside
+other Impossible Computing contributors. Authorship credit is distinct
+from the company copyright notice above.
+
+vLLM attribution and derived patch context
+-----------------------------------------
+
+The file integrations/vllm_kivi/patches/vllm-0.8.5-int4-kivi-scaffold.patch
+and the scaffold content embedded in
+integrations/vllm_kivi/source_patch.py contain substantial source context
+derived from vLLM (https://github.com/vllm-project/vllm), including
+context lines of upstream vLLM files and modifications to them. vLLM is
+licensed under the Apache License, Version 2.0 (verified against the
+upstream repository's LICENSE file at source head
+3015d5634e74d59704e2b39bab0dbe2e6f86a38a). Upstream vLLM copyright and
+license notices are preserved: vLLM files in a patched user checkout
+retain their upstream headers, and scaffold-added files carry their own
+Apache-2.0 SPDX headers. No vLLM source tree is vendored in this
+repository; the patch is applied by the user to their own vLLM checkout.
+
+Other third-party projects (NOT bundled with this repository):
+
+- HuggingFace Transformers (Apache-2.0) and PyTorch (BSD-style) —
+  invoked by the generated weight-exporter scripts at runtime for
+  model downloads. Not bundled.
+
+CUDA is a trademark of NVIDIA Corporation. NVIDIA hardware is not
+required to build or test the CPU-only paths of this repository.

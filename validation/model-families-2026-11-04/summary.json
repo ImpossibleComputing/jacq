@@ -1,0 +1,111 @@
+{
+  "based_on_model_family_commit": "e44d7903ea1b2cd7052ba09cd9c1b937d223e130",
+  "vllm_source_commit": "3015d5634e74d59704e2b39bab0dbe2e6f86a38a",
+  "vllm_runtime": "0.8.5.post2.dev0+g3015d5634.d20261103",
+  "gpu": "NVIDIA RTX 4090 index 1, sm_89",
+  "torch": "2.6.0+cu124",
+  "python": "3.12.13",
+  "transformers": "4.51.1",
+  "source_patch_sha256": "1becfdc3ac1128808f034f2d680417b8cc7a1352086aa8c0741383853841dd2a",
+  "generated_scaffold_patch_sha256": "0af676f375f2aec3720ce3b9d69175d25adcb2edfa3ea017758e126f96aad610",
+  "built_extension_sha256": "a39cdedc80b6d6473c8caacbcc722504528d6e8d26373e346e5f8c33f8ca4d68",
+  "negative_startup": {
+    "mistral": {
+      "model": "mistralai/Mistral-7B-v0.1",
+      "model_snapshot": "27d67f1b5f57dc0953326b2601d68371d40ea8da",
+      "server_status": "failed",
+      "server_exit": 1,
+      "error": "RuntimeError('server exited 1 before ready')",
+      "startup_value_error": "int4_kivi currently supports only Qwen2ForCausalLM full attention with the validated 40/8-head geometry; got architectures=['MistralForCausalLM'], model_type='mistral'",
+      "http_500_seen": false,
+      "raw_log_sha256": "333d957c5097bad769d2e817149d70ad7d44cca1a43cb0302ce4476ffe5cf811",
+      "raw_json_sha256": "89bffc653da11d8ae548b7a76e1c77811bba1c021d8eb2c7f36a1f08d994924a"
+    },
+    "qwen3": {
+      "model": "Qwen/Qwen3-0.6B",
+      "model_snapshot": "c1899de289a04d12100db370d81485cdf75e47ca",
+      "server_status": "failed",
+      "server_exit": 1,
+      "error": "RuntimeError('server exited 1 before ready')",
+      "startup_value_error": "int4_kivi currently supports only Qwen2ForCausalLM full attention with the validated 40/8-head geometry; got architectures=['Qwen3ForCausalLM'], model_type='qwen3'",
+      "http_500_seen": false,
+      "raw_log_sha256": "2f065fbd53b5115e79425615b4687458a6eed0798ad8be2a402b320e9856bb37",
+      "raw_json_sha256": "45a91d8dddfc89b1318a8ee096a8cabd3cb8b07927b657ee282defec09c104a6"
+    }
+  },
+  "positive_qwen14b": {
+    "model": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
+    "model_snapshot": "eb3172f06a6d6b3a15f08947b0668d782e4d2d2c",
+    "settings": {
+      "max_model_len": 512,
+      "block_size": 32,
+      "tensor_parallel_size": 1,
+      "prefix_caching": false,
+      "gpu_memory_utilization": 0.7,
+      "writers": [
+        "stock_fp16",
+        "jac_dsl"
+      ]
+    },
+    "baseline_status": "passed_requests",
+    "kivi_status": "passed_requests",
+    "baseline": [
+      {
+        "case": "short_one",
+        "text": " blue",
+        "finish_reason": "length",
+        "prompt_tokens": 93,
+        "completion_tokens": 1
+      },
+      {
+        "case": "long_one",
+        "text": " The",
+        "finish_reason": "length",
+        "prompt_tokens": 219,
+        "completion_tokens": 1
+      },
+      {
+        "case": "needle",
+        "text": " The secret code is LIME42",
+        "finish_reason": "length",
+        "prompt_tokens": 219,
+        "completion_tokens": 8
+      }
+    ],
+    "kivi": [
+      {
+        "case": "short_one",
+        "text": " blue",
+        "finish_reason": "length",
+        "prompt_tokens": 93,
+        "completion_tokens": 1
+      },
+      {
+        "case": "long_one",
+        "text": " The",
+        "finish_reason": "length",
+        "prompt_tokens": 219,
+        "completion_tokens": 1
+      },
+      {
+        "case": "needle",
+        "text": " The secret code is LIME42",
+        "finish_reason": "length",
+        "prompt_tokens": 219,
+        "completion_tokens": 8
+      }
+    ],
+    "exact_text_finish_and_token_count_match": true,
+    "baseline_chat": "READY",
+    "kivi_chat": "READY",
+    "kivi_op_counts": {
+      "cache_write:kivi_cache_write_jac_dsl": 27600,
+      "kivi_decode_dsl": 27600
+    },
+    "raw_baseline_json_sha256": "607cd99c65917b2dc8c39fc0a8c47416820cf8a42dd808b719cbb99691475291",
+    "raw_kivi_json_sha256": "dc98e7a03b12e7eb7b75b8399fd055622c6f6a85b53df40abe5adc8bdc257698",
+    "raw_ops_log_sha256": "4a1bd388977e6ac8be1f2ac422e0a1cbdfe793aaacfe14ef5be6243bc8a2c603",
+    "raw_baseline_server_log_sha256": "49d34e273e8d5942acdb176f721f8ef03befffcb38f053d12c388098fda87547",
+    "raw_kivi_server_log_sha256": "48c6f0d6e6f0768eed8943076778dcea52e07aae761b91a20e0afca441692b33"
+  }
+}

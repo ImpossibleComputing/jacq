@@ -1,0 +1,9 @@
+[package]
+name = "jac-ir"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+jac-syntax = { workspace = true }

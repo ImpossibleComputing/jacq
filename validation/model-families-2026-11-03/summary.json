@@ -1,0 +1,581 @@
+{
+  "provenance": {
+    "jacq_source_commit": "f1acbac8ac4771dc9c4633fa278ffbcb7028ac10",
+    "vllm_source_commit": "3015d5634e74d59704e2b39bab0dbe2e6f86a38a",
+    "python": "3.12.13",
+    "torch": "2.6.0+cu124",
+    "transformers": "4.51.1",
+    "vllm": "0.8.5.post2.dev0+g3015d5634.d20261103 (served source logs)",
+    "gpu": [
+      "0, NVIDIA GeForce RTX 4090, 8.9, 595.71.05, 24564 MiB",
+      "1, NVIDIA GeForce RTX 4090, 8.9, 595.71.05, 24564 MiB"
+    ],
+    "models": {
+      "TinyLlama/TinyLlama-1.1B-Chat-v1.0": {
+        "snapshot": "fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+        "license": "apache-2.0",
+        "cached_before_task": false,
+        "gated": false
+      },
+      "Qwen/Qwen2.5-0.5B-Instruct": {
+        "snapshot": "7ae557604adf67be50417f59c2c2f167def9a775",
+        "cached_before_task": true,
+        "license": "apache-2.0",
+        "gated": false
+      },
+      "Qwen/Qwen3-0.6B": {
+        "snapshot": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "cached_before_task": true,
+        "license": "apache-2.0",
+        "gated": false
+      },
+      "mistralai/Mistral-7B-v0.1": {
+        "snapshot": "27d67f1b5f57dc0953326b2601d68371d40ea8da",
+        "license": "apache-2.0",
+        "cached_before_task": false,
+        "gated": false
+      }
+    },
+    "model_family_branch_commit": "71d272c4814d243c79c8fb71a7a7a74bfd423728",
+    "raw_greedy_exporter_fix_commit": "d03750ce8f4ad3e61b04309d65a665981b97dfaf",
+    "gpu_used": "index 1, NVIDIA GeForce RTX 4090, sm_89",
+    "numeric_gate": "exact 20 token IDs for three prompts per standalone model",
+    "qwen_teacher_forced_max_abs_nll_difference": 0.021760940551757812,
+    "qwen_first_divergence_explanation": {
+      "original_generation_config_repetition_penalty": 1.1,
+      "raw_greedy_repetition_penalty": 1.0,
+      "first_prefix_hf_nll": {
+        "hf": 2.139256715774536,
+        "jac": 0.5298817157745361
+      },
+      "first_prefix_jac_nll": {
+        "hf": 2.1396121978759766,
+        "jac": 0.5302371978759766
+      }
+    }
+  },
+  "standalone_raw_greedy": {
+    "tinyllama": [
+      {
+        "case": "capital",
+        "prompt": "The capital of France is",
+        "prompt_tokens": 6,
+        "reference_ids": [
+          3681,
+          29889,
+          13,
+          13,
+          29906,
+          29889,
+          350,
+          29889,
+          450,
+          7483,
+          310,
+          9556,
+          338,
+          5115,
+          29889,
+          13,
+          13,
+          29941,
+          29889,
+          315
+        ],
+        "jac_ids": [
+          3681,
+          29889,
+          13,
+          13,
+          29906,
+          29889,
+          350,
+          29889,
+          450,
+          7483,
+          310,
+          9556,
+          338,
+          5115,
+          29889,
+          13,
+          13,
+          29941,
+          29889,
+          315
+        ],
+        "exact_20_tokens": true
+      },
+      {
+        "case": "needle",
+        "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber Question: What is the secret code? Answer:",
+        "prompt_tokens": 202,
+        "reference_ids": [
+          365,
+          8890,
+          29946,
+          29906,
+          2,
+          29871,
+          13,
+          29966,
+          29989,
+          1792,
+          29989,
+          29958,
+          13,
+          6028,
+          366,
+          3113,
+          3867,
+          592,
+          411,
+          278
+        ],
+        "jac_ids": [
+          365,
+          8890,
+          29946,
+          29906,
+          2,
+          29871,
+          13,
+          29966,
+          29989,
+          1792,
+          29989,
+          29958,
+          13,
+          6028,
+          366,
+          3113,
+          3867,
+          592,
+          411,
+          278
+        ],
+        "exact_20_tokens": true
+      },
+      {
+        "case": "long_context",
+        "prompt": "Read the following entries carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue item18=blue item19=blue item20=blue item21=blue item22=blue item23=blue item24=blue item25=blue item26=blue item27=blue item28=blue item29=blue item30=blue item31=blue item32=blue item33=blue item34=blue item35=blue item36=blue item37=blue item38=blue item39=blue item40=blue item41=blue item42=blue item43=blue item44=blue item45=blue item46=blue item47=blue item48=blue item49=blue item50=blue item51=blue item52=blue item53=blue item54=blue item55=blue item56=blue item57=blue item58=blue item59=blue item60=blue item61=blue item62=blue item63=blue item64=blue item65=blue item66=blue item67=blue item68=blue item69=blue item70=blue item71=blue item72=blue item73=blue item74=blue item75=blue item76=blue item77=blue item78=blue item79=blue The sky is",
+        "prompt_tokens": 400,
+        "reference_ids": [
+          7254,
+          29889,
+          450,
+          14744,
+          338,
+          7254,
+          29889,
+          450,
+          14744,
+          338,
+          7254,
+          29889,
+          450,
+          14744,
+          338,
+          7254,
+          29889,
+          450,
+          14744,
+          338
+        ],
+        "jac_ids": [
+          7254,
+          29889,
+          450,
+          14744,
+          338,
+          7254,
+          29889,
+          450,
+          14744,
+          338,
+          7254,
+          29889,
+          450,
+          14744,
+          338,
+          7254,
+          29889,
+          450,
+          14744,
+          338
+        ],
+        "exact_20_tokens": true
+      }
+    ],
+    "qwen2_5_0_5b": [
+      {
+        "case": "capital",
+        "prompt": "The capital of France is",
+        "prompt_tokens": 5,
+        "reference_ids": [
+          12095,
+          13,
+          1084,
+          374,
+          279,
+          7772,
+          3283,
+          304,
+          4505,
+          323,
+          279,
+          4843,
+          7772,
+          3283,
+          304,
+          279,
+          1879,
+          13,
+          1084,
+          374
+        ],
+        "jac_ids": [
+          12095,
+          13,
+          1084,
+          374,
+          279,
+          7772,
+          3283,
+          304,
+          4505,
+          323,
+          279,
+          4843,
+          7772,
+          3283,
+          304,
+          279,
+          1879,
+          13,
+          1084,
+          374
+        ],
+        "exact_20_tokens": true
+      },
+      {
+        "case": "needle",
+        "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber Question: What is the secret code? Answer:",
+        "prompt_tokens": 169,
+        "reference_ids": [
+          444,
+          5660,
+          19,
+          17,
+          13,
+          715,
+          14582,
+          25,
+          3555,
+          374,
+          279,
+          6234,
+          2038,
+          30,
+          21806,
+          25,
+          444,
+          5660,
+          19,
+          17
+        ],
+        "jac_ids": [
+          444,
+          5660,
+          19,
+          17,
+          13,
+          715,
+          14582,
+          25,
+          3555,
+          374,
+          279,
+          6234,
+          2038,
+          30,
+          21806,
+          25,
+          444,
+          5660,
+          19,
+          17
+        ],
+        "exact_20_tokens": true
+      },
+      {
+        "case": "long_context",
+        "prompt": "Read the following entries carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue item18=blue item19=blue item20=blue item21=blue item22=blue item23=blue item24=blue item25=blue item26=blue item27=blue item28=blue item29=blue item30=blue item31=blue item32=blue item33=blue item34=blue item35=blue item36=blue item37=blue item38=blue item39=blue item40=blue item41=blue item42=blue item43=blue item44=blue item45=blue item46=blue item47=blue item48=blue item49=blue item50=blue item51=blue item52=blue item53=blue item54=blue item55=blue item56=blue item57=blue item58=blue item59=blue item60=blue item61=blue item62=blue item63=blue item64=blue item65=blue item66=blue item67=blue item68=blue item69=blue item70=blue item71=blue item72=blue item73=blue item74=blue item75=blue item76=blue item77=blue item78=blue item79=blue The sky is",
+        "prompt_tokens": 399,
+        "reference_ids": [
+          6303,
+          13,
+          576,
+          12884,
+          374,
+          6303,
+          13,
+          576,
+          12884,
+          374,
+          6303,
+          13,
+          576,
+          12884,
+          374,
+          6303,
+          13,
+          576,
+          12884,
+          374
+        ],
+        "jac_ids": [
+          6303,
+          13,
+          576,
+          12884,
+          374,
+          6303,
+          13,
+          576,
+          12884,
+          374,
+          6303,
+          13,
+          576,
+          12884,
+          374,
+          6303,
+          13,
+          576,
+          12884,
+          374
+        ],
+        "exact_20_tokens": true
+      }
+    ],
+    "mistral_7b_short_context": [
+      {
+        "case": "capital",
+        "prompt": "The capital of France is",
+        "prompt_tokens": 6,
+        "reference_ids": [
+          264,
+          2990,
+          302,
+          1287,
+          10190,
+          28723,
+          661,
+          349,
+          264,
+          2990,
+          302,
+          3340,
+          28725,
+          5679,
+          28725,
+          1524,
+          28725,
+          8844,
+          28725,
+          304
+        ],
+        "jac_ids": [
+          264,
+          2990,
+          302,
+          1287,
+          10190,
+          28723,
+          661,
+          349,
+          264,
+          2990,
+          302,
+          3340,
+          28725,
+          5679,
+          28725,
+          1524,
+          28725,
+          8844,
+          28725,
+          304
+        ],
+        "exact_20_tokens": true
+      },
+      {
+        "case": "needle",
+        "prompt": "The secret code is LIME42. entry0=amber entry1=amber entry2=amber entry3=amber entry4=amber entry5=amber entry6=amber entry7=amber entry8=amber entry9=amber entry10=amber entry11=amber entry12=amber entry13=amber entry14=amber entry15=amber entry16=amber entry17=amber entry18=amber entry19=amber entry20=amber entry21=amber entry22=amber entry23=amber entry24=amber entry25=amber entry26=amber entry27=amber entry28=amber entry29=amber entry30=amber entry31=amber Question: What is the secret code? Answer:",
+        "prompt_tokens": 170,
+        "reference_ids": [
+          12149,
+          1574,
+          28781,
+          28750,
+          28723,
+          13,
+          13,
+          1064,
+          1824,
+          349,
+          272,
+          5169,
+          2696,
+          354,
+          272,
+          305,
+          545,
+          28804,
+          13,
+          13
+        ],
+        "jac_ids": [
+          12149,
+          1574,
+          28781,
+          28750,
+          28723,
+          13,
+          13,
+          1064,
+          1824,
+          349,
+          272,
+          5169,
+          2696,
+          354,
+          272,
+          305,
+          545,
+          28804,
+          13,
+          13
+        ],
+        "exact_20_tokens": true
+      },
+      {
+        "case": "long_context",
+        "prompt": "Read the following entries carefully: item0=blue item1=blue item2=blue item3=blue item4=blue item5=blue item6=blue item7=blue item8=blue item9=blue item10=blue item11=blue item12=blue item13=blue item14=blue item15=blue item16=blue item17=blue item18=blue item19=blue item20=blue item21=blue item22=blue item23=blue item24=blue item25=blue item26=blue item27=blue item28=blue item29=blue item30=blue item31=blue item32=blue item33=blue item34=blue item35=blue item36=blue item37=blue item38=blue item39=blue item40=blue item41=blue item42=blue item43=blue item44=blue item45=blue item46=blue item47=blue item48=blue item49=blue item50=blue item51=blue item52=blue item53=blue item54=blue item55=blue item56=blue item57=blue item58=blue item59=blue item60=blue item61=blue item62=blue item63=blue item64=blue item65=blue item66=blue item67=blue item68=blue item69=blue item70=blue item71=blue item72=blue item73=blue item74=blue item75=blue item76=blue item77=blue item78=blue item79=blue The sky is",
+        "prompt_tokens": 400,
+        "reference_ids": [
+          5045,
+          28723,
+          415,
+          7212,
+          349,
+          5045,
+          28723,
+          415,
+          7212,
+          349,
+          5045,
+          28723,
+          415,
+          7212,
+          349,
+          5045,
+          28723,
+          415,
+          7212,
+          349
+        ],
+        "jac_ids": [
+          5045,
+          28723,
+          415,
+          7212,
+          349,
+          5045,
+          28723,
+          415,
+          7212,
+          349,
+          5045,
+          28723,
+          415,
+          7212,
+          349,
+          5045,
+          28723,
+          415,
+          7212,
+          349
+        ],
+        "exact_20_tokens": true
+      }
+    ]
+  },
+  "stock_vllm": {
+    "tinyllama": {
+      "status": "passed_request",
+      "text": " Paris.\n\n2. B.",
+      "usage": {
+        "prompt_tokens": 6,
+        "total_tokens": 14,
+        "completion_tokens": 8,
+        "prompt_tokens_details": null
+      }
+    },
+    "qwen2_5_0_5b": {
+      "status": "passed_request",
+      "text": " Paris. It was founded in 7",
+      "usage": {
+        "prompt_tokens": 5,
+        "total_tokens": 13,
+        "completion_tokens": 8,
+        "prompt_tokens_details": null
+      }
+    },
+    "qwen3": {
+      "status": "passed_request",
+      "text": " Paris. The capital of Italy is Rome",
+      "usage": {
+        "prompt_tokens": 5,
+        "total_tokens": 13,
+        "completion_tokens": 8,
+        "prompt_tokens_details": null
+      }
+    },
+    "mistral": {
+      "status": "passed_request",
+      "text": " a city of many faces. It is",
+      "usage": {
+        "prompt_tokens": 6,
+        "total_tokens": 14,
+        "completion_tokens": 8,
+        "prompt_tokens_details": null
+      }
+    }
+  },
+  "kivi_negative": {
+    "tinyllama": {
+      "status": "failed",
+      "error": "RuntimeError('server exited 1 before ready')"
+    },
+    "qwen2_5_0_5b": {
+      "status": "failed",
+      "error": "RuntimeError('server exited 1 before ready')"
+    },
+    "qwen3": {
+      "status": "failed",
+      "error": "<HTTPError 500: 'Internal Server Error'>"
+    },
+    "mistral": {
+      "status": "failed",
+      "error": "<HTTPError 500: 'Internal Server Error'>"
+    }
+  },
+  "limitations": [
+    "Mistral tested below its 4096-token sliding window",
+    "Qwen3 has no valid standalone Jacq spec or Q/K norm path",
+    "KIVI positive serving remains limited to the earlier 40/8 Qwen2.5-Coder model",
+    "vLLM stock responses are availability tests, not Jacq KIVI parity tests"
+  ]
+}
