@@ -1,0 +1,118 @@
+{
+  "arms": {
+    "baseline_fp16": {
+      "status": "passed_requests",
+      "server_exit": 0,
+      "requests": [
+        {
+          "case": "short_one",
+          "text": " blue",
+          "finish_reason": "length",
+          "prompt_tokens": 93,
+          "completion_tokens": 1
+        },
+        {
+          "case": "long_one",
+          "text": " The",
+          "finish_reason": "length",
+          "prompt_tokens": 219,
+          "completion_tokens": 1
+        },
+        {
+          "case": "needle",
+          "text": " The secret code is LIME42",
+          "finish_reason": "length",
+          "prompt_tokens": 219,
+          "completion_tokens": 8
+        }
+      ],
+      "chat": {
+        "text": "READY",
+        "finish_reason": "stop",
+        "prompt_tokens": 36,
+        "completion_tokens": 2
+      },
+      "op_counts": {}
+    },
+    "kivi_hand_cuda": {
+      "status": "passed_requests",
+      "server_exit": 0,
+      "requests": [
+        {
+          "case": "short_one",
+          "text": " blue",
+          "finish_reason": "length",
+          "prompt_tokens": 93,
+          "completion_tokens": 1
+        },
+        {
+          "case": "long_one",
+          "text": " The",
+          "finish_reason": "length",
+          "prompt_tokens": 219,
+          "completion_tokens": 1
+        },
+        {
+          "case": "needle",
+          "text": " The secret code is LIME42",
+          "finish_reason": "length",
+          "prompt_tokens": 219,
+          "completion_tokens": 8
+        }
+      ],
+      "chat": {
+        "text": "READY",
+        "finish_reason": "stop",
+        "prompt_tokens": 36,
+        "completion_tokens": 2
+      },
+      "op_counts": {
+        "cache_write:kivi_cache_write_dsl": 27600,
+        "kivi_decode_dsl": 27600
+      }
+    },
+    "kivi_jac_dsl": {
+      "status": "passed_requests",
+      "server_exit": 0,
+      "requests": [
+        {
+          "case": "short_one",
+          "text": " blue",
+          "finish_reason": "length",
+          "prompt_tokens": 93,
+          "completion_tokens": 1
+        },
+        {
+          "case": "long_one",
+          "text": " The",
+          "finish_reason": "length",
+          "prompt_tokens": 219,
+          "completion_tokens": 1
+        },
+        {
+          "case": "needle",
+          "text": " The secret code is LIME42",
+          "finish_reason": "length",
+          "prompt_tokens": 219,
+          "completion_tokens": 8
+        }
+      ],
+      "chat": {
+        "text": "READY",
+        "finish_reason": "stop",
+        "prompt_tokens": 36,
+        "completion_tokens": 2
+      },
+      "op_counts": {
+        "cache_write:kivi_cache_write_jac_dsl": 27600,
+        "kivi_decode_dsl": 27600
+      }
+    }
+  },
+  "parity_with_stock": {
+    "kivi_hand_cuda": true,
+    "kivi_jac_dsl": true
+  },
+  "positive_jacq_decode": true,
+  "positive_jacq_writer": true
+}

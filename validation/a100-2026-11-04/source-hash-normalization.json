@@ -1,0 +1,10 @@
+{
+  "raw_file": "generated-sha256.txt",
+  "raw_sha256": "348317f156086030168972988480b9138b874164dd726175d7dc60b66ff9a102",
+  "portable_file": "kivi-cuda-source-sha256.txt",
+  "portable_sha256": "6804b3905752954efff2292cfeb75a2dba14c6622e81860ce58770132cfbe236",
+  "transformation": "For each line, strip the absolute source-root prefix before csrc/kivi/; retain the CUDA source digest and basename unchanged.",
+  "entry_count": 9,
+  "jacq_emitted_entries": 8,
+  "hand_cuda_scaffold_entry": "csrc/kivi/cache_write_kivi_dsl.cu"
+}

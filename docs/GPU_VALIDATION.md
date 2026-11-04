@@ -3,8 +3,11 @@
 The emitted paged KIVI kernel passed a direct-launch smoke on an RTX 4090
 with four synthetic cases on November 3, 2026. This checks the generated
 CUDA launch path. A [512-configured vLLM serving run](VERIFIED_SERVING.md)
-has also passed for one 14B model on an RTX 4090. The steps below show how to
-repeat and extend that check.
+has also passed for one 14B model on an RTX 4090. A
+[smaller A100 follow-up](VERIFIED_SERVING.md#a100-follow-up-november-4-2026)
+used the public Jacq release with the same model and three synthetic
+completions plus one chat request per arm. The steps below show how to repeat
+and extend these checks.
 
 Use one idle NVIDIA GPU for each paired measurement. Record the Jacq commit,
 vLLM commit/build, GPU, model revision, commands, settings, and raw outputs.

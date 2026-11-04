@@ -57,6 +57,9 @@ An RTX 4090 direct-launch smoke of the emitted paged KIVI kernel passed four
 synthetic cases. A [verified vLLM serving run](docs/VERIFIED_SERVING.md) on
 November 3, 2026 matched stock fp16 output across seven completion requests
 for both int4-KIVI cache writers on one 14B model. See
+[the A100 serving follow-up](docs/VERIFIED_SERVING.md#a100-follow-up-november-4-2026)
+for a second GPU architecture tested with the public Jacq release and a
+smaller synthetic request set. See
 [the model-family checks](validation/model-families-2026-11-03/README.md) for
 scoped standalone TinyLlama, Qwen2.5, and Mistral results and
 [the startup compatibility follow-up](validation/model-families-2026-11-04/README.md)

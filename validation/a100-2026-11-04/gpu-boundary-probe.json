@@ -1,0 +1,62 @@
+[
+  {
+    "seq_len": 128,
+    "width": 0,
+    "status": "accepted",
+    "finite": true
+  },
+  {
+    "seq_len": 129,
+    "width": 0,
+    "status": "accepted",
+    "finite": true
+  },
+  {
+    "seq_len": 159,
+    "width": 0,
+    "status": "accepted",
+    "finite": true
+  },
+  {
+    "seq_len": 160,
+    "width": 1,
+    "status": "accepted",
+    "finite": true
+  },
+  {
+    "seq_len": 191,
+    "width": 1,
+    "status": "accepted",
+    "finite": true
+  },
+  {
+    "seq_len": 192,
+    "width": 2,
+    "status": "accepted",
+    "finite": true
+  },
+  {
+    "seq_len": 4096,
+    "width": 124,
+    "status": "accepted",
+    "finite": true
+  },
+  {
+    "seq_len": 160,
+    "width": 0,
+    "status": "rejected",
+    "error": "BLOCK_TABLE dim 0 must be at least 1 for Qwen2.5-Coder-32B KIVI DSL ABI, got 0"
+  },
+  {
+    "seq_len": 192,
+    "width": 1,
+    "status": "rejected",
+    "error": "BLOCK_TABLE dim 0 must be at least 2 for Qwen2.5-Coder-32B KIVI DSL ABI, got 1"
+  },
+  {
+    "seq_len": 4096,
+    "width": 123,
+    "status": "rejected",
+    "error": "BLOCK_TABLE dim 0 must be at least 124 for Qwen2.5-Coder-32B KIVI DSL ABI, got 123"
+  }
+]

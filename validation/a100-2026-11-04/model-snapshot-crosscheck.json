@@ -1,0 +1,47 @@
+{
+  "model_id": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
+  "revision": "eb3172f06a6d6b3a15f08947b0668d782e4d2d2c",
+  "files": [
+    {
+      "file": "config.json",
+      "retained_sha256": "af62852325fc708a05ee3fba8b7b0c53d352e2689870bff176098347fefa8ad0",
+      "official_revision_value": "af62852325fc708a05ee3fba8b7b0c53d352e2689870bff176098347fefa8ad0",
+      "official_check": "GET content SHA-256",
+      "official_url": "https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-AWQ/raw/eb3172f06a6d6b3a15f08947b0668d782e4d2d2c/config.json",
+      "match": true
+    },
+    {
+      "file": "tokenizer.json",
+      "retained_sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+      "official_revision_value": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+      "official_check": "GET content SHA-256",
+      "official_url": "https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-AWQ/raw/eb3172f06a6d6b3a15f08947b0668d782e4d2d2c/tokenizer.json",
+      "match": true
+    },
+    {
+      "file": "model-00001-of-00003.safetensors",
+      "retained_sha256": "aacd6553a9ca787eb72d85761442afaaa02bc42d2ef677d9752060fb333aa0df",
+      "official_revision_value": "aacd6553a9ca787eb72d85761442afaaa02bc42d2ef677d9752060fb333aa0df",
+      "official_check": "HEAD x-linked-etag",
+      "official_url": "https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-AWQ/resolve/eb3172f06a6d6b3a15f08947b0668d782e4d2d2c/model-00001-of-00003.safetensors",
+      "match": true
+    },
+    {
+      "file": "model-00002-of-00003.safetensors",
+      "retained_sha256": "735a941a5b54c0ea645df2642314e187c4d590ac08cb01b5150bf09330bbf4bb",
+      "official_revision_value": "735a941a5b54c0ea645df2642314e187c4d590ac08cb01b5150bf09330bbf4bb",
+      "official_check": "HEAD x-linked-etag",
+      "official_url": "https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-AWQ/resolve/eb3172f06a6d6b3a15f08947b0668d782e4d2d2c/model-00002-of-00003.safetensors",
+      "match": true
+    },
+    {
+      "file": "model-00003-of-00003.safetensors",
+      "retained_sha256": "1c0174225b114921e13f0263c00d039f6609d6f25563fe100b13d92deb1a7b08",
+      "official_revision_value": "1c0174225b114921e13f0263c00d039f6609d6f25563fe100b13d92deb1a7b08",
+      "official_check": "HEAD x-linked-etag",
+      "official_url": "https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-AWQ/resolve/eb3172f06a6d6b3a15f08947b0668d782e4d2d2c/model-00003-of-00003.safetensors",
+      "match": true
+    }
+  ],
+  "served_model_evidence": "Retained serving JSON and server logs use the same local model directory; vLLM V1 logs show AWQ Marlin, fp16, and three safetensors shards loaded. The direct boundary probe is a separate synthetic tensor test."
+}

@@ -1,0 +1,23 @@
+{
+  "preflight.json": "b4d5a1a7508b307acf5bb31e70d26d9fda9fe2a4da0ba4d6db546f8a89850995",
+  "patch.json": "a0d0066aa297790f570f31993ae97c04e3b06213bbf7d99d728584af9aedd659",
+  "emit.jsonl": "db7c0eef7ac3f18d27cd25156968f9e55bb4c8f7effc8ba8d677850331926f12",
+  "generated-sha256.txt": "348317f156086030168972988480b9138b874164dd726175d7dc60b66ff9a102",
+  "model-sha256.txt": "e2c25c671dd35d90b347be789d8cd51e888c93ed1949854c13417444dc66fc30",
+  "gpu-boundary-probe.log": "9c1b7039352b7ab5927771da7da4393537b9a442dbd01c945f7ff0a1ead36c1b",
+  "op-registration.log": "5c3f6877f11240e5a0a5cfc51c9953783506b8def87ad1c597b3bdb75f1eecbb",
+  "platform-import.log": "a77263638d1cbdcf5a7732d1bf8c96c4e594dd3245a2d886d743045009e24746",
+  "vllm-build-3.log": "cb95a82cdfe95c08ec6479a0e7cb2dcf2877d845a92da0b23f0e8b49b2fa910c",
+  "vllm-c-sha256-final.txt": "d7c23e6817f69ec4bfec81ec3c61451928cc02687700ce8adb7ee07e307377da",
+  "pip-freeze-final.txt": "fac5d7083ea9045cd46fe5eaafbf40e71ec4021d6986631a8ac4bc87b5d6bd1d",
+  "serving-runner.log": "2aaaa99bd2a0063ab6ce66487baa686f053fb7a97ce5b17a40f954af22a98f91",
+  "serving-hand-runner.log": "2895045084ce189a36123efcf77b38cd471b2c264ab100a41e69972ce115a538",
+  "serving-512/baseline_fp16.json": "cd75b1205f6cc46656ed269f4ec5a4c7ae460131ee7dd4d06f8ead3d6ad88621",
+  "serving-512/kivi_hand_cuda.json": "5a2b578d22f57a299fe56b170aab1259b5f13028f9f7da14992b59440759ff02",
+  "serving-512/kivi_jac_dsl.json": "640afd130cb90beec31f56317f219f48caf3b22e0d7f8081e7d77e9f29215b14",
+  "serving-512/baseline_fp16.server.log": "41da3ef88da3c5b76818b3e3a4bf044b5ec90b5f8a0946dc69d2a697a611bf0e",
+  "serving-512/kivi_hand_cuda.server.log": "8f51bce6beba72aaa878bc0577d9245eec01353d1f922673e494be8434fc295a",
+  "serving-512/kivi_jac_dsl.server.log": "94f8ce7206550901b1a9be5fe5b88ecb1d58c8707ed62cb6c529f77264c213fe",
+  "serving-512/kivi_hand_cuda.ops.log": "745737ec65bf64b8cdaeb953d20221d9d0fd91b82d21c0989785f5c7f99a43ba",
+  "serving-512/kivi_jac_dsl.ops.log": "d642e7e19270179b14cc436567c7e526b5a1a4a4c32e1fe16cd01b2c93b39d61"
+}

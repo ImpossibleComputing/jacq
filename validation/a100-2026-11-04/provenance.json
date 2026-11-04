@@ -1,0 +1,72 @@
+{
+  "date_utc": "2026-11-04",
+  "source": {
+    "jacq_public_url": "https://github.com/ImpossibleComputing/jacq.git",
+    "jacq_commit": "1c797da0ec1c67c6b987a984a5f4c304cc52c77a",
+    "jacq_tree": "d7af3d8f86096ece92dbc2a855c6d97eae3d043b",
+    "vllm_public_url": "https://github.com/vllm-project/vllm.git",
+    "vllm_commit": "3015d5634e74d59704e2b39bab0dbe2e6f86a38a",
+    "vllm_runtime_version": "0.8.5.post2.dev0+g3015d5634.d20261104",
+    "vllm_extension_sha256": "1d484702147c73cca94656f8d2c597110d9cbc9d8f81f0d465c49d406e4305c3"
+  },
+  "model": {
+    "repo": "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ",
+    "revision": "eb3172f06a6d6b3a15f08947b0668d782e4d2d2c",
+    "architecture": "Qwen2ForCausalLM",
+    "activation_dtype": "float16",
+    "num_hidden_layers": 48,
+    "num_attention_heads": 40,
+    "num_key_value_heads": 8,
+    "quantization": "AWQ 4-bit weights"
+  },
+  "hardware": {
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "compute_capability": "8.0",
+    "driver": "595.91.07",
+    "cuda_toolkit": "12.4.131"
+  },
+  "software": {
+    "python": "3.11.10",
+    "torch": "2.6.0+cu124",
+    "transformers": "4.51.1",
+    "rust": "1.98.1",
+    "setuptools": "80.9.0"
+  },
+  "serving": {
+    "max_model_len": 512,
+    "block_size": 32,
+    "tensor_parallel_size": 1,
+    "prefix_caching": false,
+    "seed": 42,
+    "temperature": 0,
+    "waves": 0,
+    "arms": [
+      "baseline_fp16",
+      "kivi_hand_cuda",
+      "kivi_jac_dsl"
+    ],
+    "request_count_per_arm": 3,
+    "chat_count_per_arm": 1,
+    "prompt_tokens": [
+      93,
+      219,
+      219
+    ],
+    "completion_tokens": [
+      1,
+      1,
+      8
+    ],
+    "chat_prompt_tokens": 36,
+    "chat_completion_tokens": 2
+  },
+  "evidence_scope": "synthetic prompts and normalized outputs only; raw logs retained separately",
+  "direct_gpu_probe": {
+    "synthetic_tensors": true,
+    "num_attention_heads": 40,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "model_weights_loaded": false,
+    "interpretation": "block-table boundary acceptance and finite output only; independent of 14B serving"
+  }
+}

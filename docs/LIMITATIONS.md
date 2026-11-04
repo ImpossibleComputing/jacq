@@ -7,6 +7,9 @@ also passed four synthetic cases for the emitted paged KIVI kernel on November
 3, 2026. A [vLLM serving run](VERIFIED_SERVING.md) also matched stock fp16
 outputs across seven completion requests in each of two int4-KIVI writer
 arms on one RTX 4090 and a 14B model.
+A [public-source A100 follow-up](VERIFIED_SERVING.md#a100-follow-up-november-4-2026)
+matched the same three cache configurations on three synthetic completions
+and one chat request per arm under a 512-token serving configuration.
 
 ## Supported vLLM lane
 
