@@ -1,4 +1,4 @@
-# Verified vLLM serving run
+# Verified vLLM serving runs
 
 On November 3, 2026, the patched vLLM 0.8.5 build served
 `Qwen/Qwen2.5-Coder-14B-Instruct-AWQ` with three cache configurations on one
@@ -68,3 +68,27 @@ This run covers sequential requests with 93- and 219-token prompts under a
 512-token configuration. The 4096 boundary was checked by a direct CUDA op
 probe, not a full-model 4096-token request. Streaming, concurrent serving,
 other models or GPUs, and performance were outside this run.
+
+## A100 follow-up (November 4, 2026)
+
+The [A100 evidence bundle](../validation/a100-2026-11-04/README.md) records a
+second GPU architecture using public Jacq commit
+`1c797da0ec1c67c6b987a984a5f4c304cc52c77a`, pinned vLLM source commit
+`3015d5634e74d59704e2b39bab0dbe2e6f86a38a`, and model snapshot
+`eb3172f06a6d6b3a15f08947b0668d782e4d2d2c` of
+`Qwen/Qwen2.5-Coder-14B-Instruct-AWQ`. It ran on one A100 80 GB (`sm_80`)
+with CUDA toolkit 12.4.131, PyTorch `2.6.0+cu124`, and Python 3.11.10.
+
+With a 512-token configured context, three synthetic completion requests
+(93, 219, and 219 prompt tokens) and one chat request per arm returned
+identical text, finish reasons, and token counts for stock fp16 caching,
+int4-KIVI with the hand-CUDA writer, and int4-KIVI with the Jacq DSL writer.
+The captured operation traces record 27,600 Jacq decode calls in each KIVI
+arm and 27,600 calls to the selected writer in each arm. The DSL writer arm
+therefore exercised both generated decode and generated cache-write ops.
+
+A separate direct CUDA op probe accepted the required block-table widths at
+sequence lengths 128, 129, 159, 160, 191, 192, and 4096, and rejected three
+insufficient widths. The 4096 case was not a full-model serving request.
+This A100 run does not measure performance or exercise TP=2, concurrency,
+streaming, other models, or longer-context serving.
